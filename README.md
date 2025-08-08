@@ -54,7 +54,7 @@ make
 Execute the compiled binary.
 
 ```bash
-./chess
+./chessgame
 ```
 
 ---
