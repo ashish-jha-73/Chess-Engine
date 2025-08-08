@@ -20,7 +20,7 @@ Follow these steps to compile and run the project on your local machine.
 ### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/ashish-jha-73/Chess-Engine.git](https://github.com/ashish-jha-73/Chess-Engine.git)
+git clone https://github.com/ashish-jha-73/Chess-Engine.git
 cd Chess-Engine
 ```
 
