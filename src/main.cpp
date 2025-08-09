@@ -4,17 +4,17 @@
 #include <functional>
 #include <chrono>
 #include <cmath>
+#include <thread>   
+#include <mutex>    
+#include <atomic>   
 
-// Include the organized headers
 #include "../include/chess.hpp"
 #include "../include/engine.hpp"
 
 using namespace std;
 
-// A small utility function that can stay in main
 bool inBounds(int r,int c){return r>=0&&r<8&&c>=0&&c<8;}
 
-// UI Button structure
 struct UIButton {
     sf::RectangleShape rect;
     sf::Text label;
@@ -58,7 +58,11 @@ int main(){
         currentMenuX += width + menuPadding;
     };
     
-    bool aiEnabled = false, aiPlaysWhite = false; int aiDepth = 3;
+    atomic<bool> isAIThinking{false};
+    optional<Move> aiMoveResult;
+    mutex aiMoveMutex;
+    
+    bool aiEnabled = false, aiPlaysWhite = false; int aiDepth = 2;
     optional<string> gameOverMsg = nullopt;
     optional<pair<int, int>> selectedSquare;
     vector<Move> legalMovesForSelected;
@@ -71,11 +75,18 @@ int main(){
     optional<Move> pendingPromotionMove;
 
     auto maybeDoAIMove = [&](){
-        if(!gameOverMsg && aiEnabled && gs.whiteToMove == aiPlaysWhite) {
-             // AI's turn: simply call the engine to get the best move
-             Move m = computeBestMove(gs, aiDepth);
-             makeMove(gs, m);
-             gameOverMsg = checkGameOver(gs);
+        if(!gameOverMsg && aiEnabled && gs.whiteToMove == aiPlaysWhite && !isAIThinking) {
+             isAIThinking = true;
+             
+             std::thread([&, gs_copy = gs, aiDepth](){
+                Move bestMove = computeBestMove(gs_copy, aiDepth);
+                
+                {
+                    std::lock_guard<std::mutex> lock(aiMoveMutex);
+                    aiMoveResult = bestMove;
+                }
+                isAIThinking = false;
+             }).detach(); 
         }
     };
     
@@ -87,6 +98,7 @@ int main(){
         if (aiEnabled && aiPlaysWhite) { maybeDoAIMove(); }
     });
     addButton("Undo", 60, [&](){
+        if(isAIThinking) return;
         if (gs.history.empty()) return;
         if (aiEnabled) { undoMove(gs); if (!gs.history.empty()) { undoMove(gs); } } 
         else { undoMove(gs); }
@@ -96,6 +108,7 @@ int main(){
     });
     addButton("Save", 60, [&](){ /* ... */ });
     addButton("Play vs AI: OFF", 140, [&](){
+        if(isAIThinking) return; 
         auto& aiButtonLabel = buttons[3].label;
         if (!aiEnabled) {
             aiEnabled = true; aiPlaysWhite = false; aiButtonLabel.setString("AI plays Black");
@@ -117,8 +130,25 @@ int main(){
     promotionBg.setOutlineThickness(2.f);
     promotionBg.setPosition( (window.getSize().x - promotionBg.getSize().x) / 2.f, (window.getSize().y - promotionBg.getSize().y) / 2.f );
     map<int, sf::Sprite> promotionSprites;
+while(window.isOpen()){
+        if (!isAIThinking) {
+            optional<Move> completedMove;
+            {
+                std::lock_guard<std::mutex> lock(aiMoveMutex);
+                if(aiMoveResult.has_value()){
+                    completedMove = aiMoveResult;
+                    aiMoveResult = std::nullopt; 
+                }
+            }
 
-    while(window.isOpen()){
+            if(completedMove.has_value()){
+                if(aiEnabled && gs.whiteToMove == aiPlaysWhite){
+                    makeMove(gs, *completedMove);
+                    gameOverMsg = checkGameOver(gs);
+                }
+            }
+        }
+
         sf::Event ev;
         while(window.pollEvent(ev)){
             if(ev.type == sf::Event::Closed) window.close();
@@ -151,7 +181,7 @@ int main(){
                     }
                 }
             } 
-            else if (!gameOverMsg) {
+            else if (!gameOverMsg && !isAIThinking) {
                 int c = mp.x / 80;
                 int r = (mp.y - 40) / 80;
 
@@ -258,8 +288,10 @@ int main(){
                     }
                 }
             }
-            if(!isDuplicatePromotion) moveHint.setPosition(move.dy * 80 + 40 - 15, boardYOffset + move.dx * 80 + 40 - 15);
-            window.draw(moveHint);
+            if(!isDuplicatePromotion) {
+                moveHint.setPosition(move.dy * 80 + 40 - 15, boardYOffset + move.dx * 80 + 40 - 15);
+                window.draw(moveHint);
+            }
         }
         for(int r=0;r<8;r++) {
             for(int c=0;c<8;c++){
@@ -296,6 +328,16 @@ int main(){
                 s.setPosition(startX + i * (80 + 10), promotionBg.getPosition().y + 5);
                 window.draw(s);
             }
+        }
+
+        if (isAIThinking) {
+            sf::Text aiStatusText;
+            aiStatusText.setFont(font);
+            aiStatusText.setString("AI is thinking...");
+            aiStatusText.setCharacterSize(20);
+            aiStatusText.setFillColor(sf::Color::Blue);
+            aiStatusText.setPosition(window.getSize().x - aiStatusText.getLocalBounds().width - 150, window.getSize().y - 30);
+            window.draw(aiStatusText);
         }
         
         window.display();

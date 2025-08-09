@@ -2,4 +2,4 @@
 
 #include "chess.hpp"
 
-Move computeBestMove(GameState &gs, int depth);
+Move computeBestMove(GameState gs, int depth);
