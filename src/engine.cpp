@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <vector>
 
-// --- AI Helper Functions (internal to this file) ---
 namespace {
     int pieceValue(int pt){
         switch(pt){
@@ -32,7 +31,7 @@ namespace {
             if(isInCheck(gs, gs.whiteToMove)) {
                 return maximizingPlayer ? -1000000 : 1000000;
             } else {
-                return 0; // Stalemate
+                return 0; 
             }
         }
 
@@ -47,7 +46,7 @@ namespace {
                 if(alpha>=beta) break;
             }
             return value;
-        } else { // Minimizing player
+        } else {
             int value = std::numeric_limits<int>::max();
             for(auto &m: moves){
                 GameState copy = gs;
@@ -61,8 +60,6 @@ namespace {
         }
     }
 }
-
-// --- Public AI Function ---
 
 Move computeBestMove(GameState gs, int depth){
     auto moves = generateLegalMoves(gs);

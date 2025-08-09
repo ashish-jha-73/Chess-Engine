@@ -3,7 +3,6 @@
 #include <vector>
 #include <map>
 
-// --- Helper Functions (internal to this file) ---
 namespace {
     bool inBounds(int r,int c){return r>=0&&r<8&&c>=0&&c<8;}
     
@@ -72,13 +71,8 @@ void GameState::loadFromFen(const std::string& fen) {
         }
     }
 
-    // 5. Halfmove Clock (optional)
     halfmoveClock = (parts.size() > 4) ? std::stoi(parts[4]) : 0;
-    
-    // 6. Fullmove Number (optional)
-    fullmoveNumber = (parts.size() > 5) ? std::stoi(parts[5]) : 1;
-    
-    // Finally, record the starting position for threefold repetition check
+    fullmoveNumber = (parts.size() > 5) ? std::stoi(parts[5]) : 1;    
     positionCounts[boardToString(this->board)]++;
 }
 
@@ -86,7 +80,6 @@ void GameState::initStandard() {
     loadFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 }
 
-// --- Game Logic Function Implementations ---
 
 bool isSquareAttacked(const Board &board, int r, int c, bool byWhite) {
     int dir = byWhite ? 1 : -1;
