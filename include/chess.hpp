@@ -36,19 +36,12 @@ struct GameState {
     std::optional<std::pair<int,int>> enPassantTarget;
     std::vector<Move> history;
     int halfmoveClock = 0;
+    int fullmoveNumber = 1; // For FEN
     std::map<std::string, int> positionCounts; // For threefold repetition
+    std::string initialFen; // To allow undo from any starting position
 
-    void initStandard() {
-        for(int r=0;r<8;r++) for(int c=0;c<8;c++) board[r][c]={EMPTY,false};
-        for(int c=0;c<8;c++) { board[1][c]={P,false}; board[6][c]={P,true}; }
-        std::array<int,8> order = {R,N,B,Q,K,B,N,R};
-        for(int c=0;c<8;c++) { board[0][c]={(int)order[c],false}; board[7][c]={(int)order[c],true}; }
-        whiteToMove = true; wkMoved = wrAHMoved = wrHHMoved = false;
-        bkMoved = brAHMoved = brHHMoved = false; enPassantTarget = std::nullopt; history.clear(); halfmoveClock = 0;
-        
-        positionCounts.clear();
-        positionCounts[boardToString(this->board)]++;
-    }
+    void initStandard();
+    void loadFromFen(const std::string& fen);
 };
 
 

@@ -64,17 +64,12 @@ namespace {
 
 // --- Public AI Function ---
 
-// The GameState `gs` is now taken by value to ensure thread safety.
 Move computeBestMove(GameState gs, int depth){
     auto moves = generateLegalMoves(gs);
     Move bestMove;
     if (moves.empty()) {
-        // Should not happen if game over is checked, but as a fallback:
         return Move{-1,-1,-1,-1};
     }
-    
-    // Sort moves to improve alpha-beta pruning effectiveness (optional but good practice)
-    // For simplicity, we'll proceed without move ordering for now.
     
     bestMove = moves.front();
     int bestVal = gs.whiteToMove ? -std::numeric_limits<int>::max() : std::numeric_limits<int>::max();

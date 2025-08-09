@@ -1,10 +1,89 @@
 #include "../include/chess.hpp"
 #include <sstream>
+#include <vector>
 #include <map>
 
 // --- Helper Functions (internal to this file) ---
 namespace {
     bool inBounds(int r,int c){return r>=0&&r<8&&c>=0&&c<8;}
+    
+    // Splits a string by a delimiter
+    std::vector<std::string> split(const std::string& s, char delimiter) {
+       std::vector<std::string> tokens;
+       std::string token;
+       std::istringstream tokenStream(s);
+       while (std::getline(tokenStream, token, delimiter)) {
+          tokens.push_back(token);
+       }
+       return tokens;
+    }
+}
+
+void GameState::loadFromFen(const std::string& fen) {
+    // Clear all previous state
+    board.fill({ });
+    history.clear();
+    positionCounts.clear();
+    initialFen = fen;
+
+    auto parts = split(fen, ' ');
+    if (parts.size() < 4) return; // Basic validation
+
+    // 1. Piece Placement
+    int r = 0, c = 0;
+    for (char ch : parts[0]) {
+        if (ch == '/') {
+            r++; c = 0;
+        } else if (isdigit(ch)) {
+            c += ch - '0';
+        } else {
+            Piece p;
+            p.white = isupper(ch);
+            switch (tolower(ch)) {
+                case 'p': p.type = P; break; case 'n': p.type = N; break;
+                case 'b': p.type = B; break; case 'r': p.type = R; break;
+                case 'q': p.type = Q; break; case 'k': p.type = K; break;
+                default: p.type = EMPTY; break;
+            }
+            if (inBounds(r,c)) { board[r][c] = p; }
+            c++;
+        }
+    }
+
+    // 2. Active Color
+    whiteToMove = (parts[1] == "w");
+
+    // 3. Castling Availability
+    std::string castling = parts[2];
+    wkMoved = (castling.find('K') == std::string::npos && castling.find('Q') == std::string::npos);
+    bkMoved = (castling.find('k') == std::string::npos && castling.find('q') == std::string::npos);
+    wrHHMoved = (castling.find('K') == std::string::npos);
+    wrAHMoved = (castling.find('Q') == std::string::npos);
+    brHHMoved = (castling.find('k') == std::string::npos);
+    brAHMoved = (castling.find('q') == std::string::npos);
+
+    // 4. En Passant Target
+    enPassantTarget = std::nullopt;
+    if (parts[3] != "-") {
+        int ep_c = parts[3][0] - 'a';
+        int ep_r = 8 - (parts[3][1] - '0');
+        if (inBounds(ep_r, ep_c)) {
+            enPassantTarget = std::make_pair(ep_r, ep_c);
+        }
+    }
+
+    // 5. Halfmove Clock (optional)
+    halfmoveClock = (parts.size() > 4) ? std::stoi(parts[4]) : 0;
+    
+    // 6. Fullmove Number (optional)
+    fullmoveNumber = (parts.size() > 5) ? std::stoi(parts[5]) : 1;
+    
+    // Finally, record the starting position for threefold repetition check
+    positionCounts[boardToString(this->board)]++;
+}
+
+void GameState::initStandard() {
+    loadFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 }
 
 // --- Game Logic Function Implementations ---
@@ -105,15 +184,11 @@ std::vector<Move> generatePseudoLegalMoves(const GameState &gs) {
                         }}
                     if (!isInCheck(gs, wtm)) {
                         if(p.white){
-                            if(!gs.wkMoved){
-                                if(!gs.wrHHMoved && board[7][5].type==EMPTY && board[7][6].type==EMPTY){ if(!isSquareAttacked(board,7,5,!wtm) && !isSquareAttacked(board,7,6,!wtm)) { moves.push_back({7,4,7,6,{},false,true});}}
-                                if(!gs.wrAHMoved && board[7][1].type==EMPTY && board[7][2].type==EMPTY && board[7][3].type==EMPTY){ if(!isSquareAttacked(board,7,2,!wtm) && !isSquareAttacked(board,7,3,!wtm)) { moves.push_back({7,4,7,2,{},false,true});}}
-                            }
+                            if(!gs.wkMoved && !gs.wrHHMoved && board[7][5].type==EMPTY && board[7][6].type==EMPTY){ if(!isSquareAttacked(board,7,5,!wtm) && !isSquareAttacked(board,7,6,!wtm)) { moves.push_back({7,4,7,6,{},false,true});}}
+                            if(!gs.wkMoved && !gs.wrAHMoved && board[7][1].type==EMPTY && board[7][2].type==EMPTY && board[7][3].type==EMPTY){ if(!isSquareAttacked(board,7,2,!wtm) && !isSquareAttacked(board,7,3,!wtm)) { moves.push_back({7,4,7,2,{},false,true});}}
                         } else {
-                            if(!gs.bkMoved){
-                                if(!gs.brHHMoved && board[0][5].type==EMPTY && board[0][6].type==EMPTY){ if(!isSquareAttacked(board,0,5,!wtm) && !isSquareAttacked(board,0,6,!wtm)) { moves.push_back({0,4,0,6,{},false,true});}}
-                                if(!gs.brAHMoved && board[0][1].type==EMPTY && board[0][2].type==EMPTY && board[0][3].type==EMPTY){ if(!isSquareAttacked(board,0,2,!wtm) && !isSquareAttacked(board,0,3,!wtm)) { moves.push_back({0,4,0,2,{},false,true});}}
-                            }
+                            if(!gs.bkMoved && !gs.brHHMoved && board[0][5].type==EMPTY && board[0][6].type==EMPTY){ if(!isSquareAttacked(board,0,5,!wtm) && !isSquareAttacked(board,0,6,!wtm)) { moves.push_back({0,4,0,6,{},false,true});}}
+                            if(!gs.bkMoved && !gs.brAHMoved && board[0][1].type==EMPTY && board[0][2].type==EMPTY && board[0][3].type==EMPTY){ if(!isSquareAttacked(board,0,2,!wtm) && !isSquareAttacked(board,0,3,!wtm)) { moves.push_back({0,4,0,2,{},false,true});}}
                         }
                     }
                 } break;
@@ -127,6 +202,8 @@ std::vector<Move> generatePseudoLegalMoves(const GameState &gs) {
 void makeMove(GameState &gs, const Move &m){
     Piece movingPiece = gs.board[m.sx][m.sy];
     if(movingPiece.type == P || m.captured.has_value()) gs.halfmoveClock = 0; else gs.halfmoveClock++;
+    if (!gs.whiteToMove) gs.fullmoveNumber++;
+
     if (m.isCastle) {
         gs.board[m.dx][m.dy] = movingPiece; gs.board[m.sx][m.sy] = {EMPTY,false};
         if (m.dy == 6) { gs.board[m.dx][5] = gs.board[m.dx][7]; gs.board[m.dx][7] = {EMPTY,false}; }
@@ -152,12 +229,22 @@ void makeMove(GameState &gs, const Move &m){
     gs.history.push_back(m);
     gs.whiteToMove = !gs.whiteToMove;
 
-    // Update repetition count
     std::string currentPos = boardToString(gs.board);
     gs.positionCounts[currentPos]++;
 }
 
-void undoMove(GameState &gs){ if(gs.history.empty()) return; GameState base; base.initStandard(); std::vector<Move> hist = gs.history; hist.pop_back(); gs = base; for(const auto &mv : hist) makeMove(gs,mv); }
+void undoMove(GameState &gs){ 
+    if(gs.history.empty()) return;
+    
+    std::vector<Move> hist = gs.history;
+    hist.pop_back();
+    gs.loadFromFen(gs.initialFen); 
+    
+    for(const auto &mv : hist) {
+        makeMove(gs, mv);
+    }
+}
+
 std::vector<Move> generateLegalMoves(const GameState &gs){ std::vector<Move> out; auto pseudo = generatePseudoLegalMoves(gs); for(auto &m: pseudo){ GameState copy = gs; makeMove(copy,m); if(!isInCheck(copy, gs.whiteToMove)) out.push_back(m); } return out; }
 
 bool hasSufficientMaterial(const GameState &gs) {

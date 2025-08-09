@@ -62,7 +62,7 @@ int main(){
     optional<Move> aiMoveResult;
     mutex aiMoveMutex;
     
-    bool aiEnabled = false, aiPlaysWhite = false; int aiDepth = 2;
+    bool aiEnabled = false, aiPlaysWhite = false; int aiDepth = 4;
     optional<string> gameOverMsg = nullopt;
     optional<pair<int, int>> selectedSquare;
     vector<Move> legalMovesForSelected;
@@ -130,7 +130,7 @@ int main(){
     promotionBg.setOutlineThickness(2.f);
     promotionBg.setPosition( (window.getSize().x - promotionBg.getSize().x) / 2.f, (window.getSize().y - promotionBg.getSize().y) / 2.f );
     map<int, sf::Sprite> promotionSprites;
-while(window.isOpen()){
+    while(window.isOpen()){
         if (!isAIThinking) {
             optional<Move> completedMove;
             {

@@ -1,7 +1,7 @@
 # Compiler and flags
 CXX = g++
 CXXFLAGS = -Wall -Wextra -std=c++23 -Iinclude
-LDFLAGS = -lsfml-graphics -lsfml-window -lsfml-system -lsfml-audio
+LDFLAGS = -lsfml-graphics -lsfml-window -lsfml-system
 
 # Source and output
 SRC = src/main.cpp src/engine.cpp src/chess.cpp
