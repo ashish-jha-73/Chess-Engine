@@ -56,19 +56,10 @@ Execute the compiled binary.
 ```bash
 make run
 ```
+or 
 
----
-
-## 📂 Project Structure
-
-```
-Chess-Engine/
-│
-├── assets/      # Piece textures, board images
-├── src/         # C++ source code files
-├── include/     # Header files
-├── README.md    # Project documentation
-└── Makefile     # (Optional) Build automation
+```bash
+bash chessgame
 ```
 
 ---
