@@ -108,6 +108,86 @@ int pieceValue(int pt)
     }
 }
 
+bool hasMatingMaterial(const GameState& gs, bool white)
+{
+    int bishops = 0, knights = 0, rooks = 0, queens = 0;
+
+    for(int r=0;r<8;r++)
+        for(int c=0;c<8;c++){
+            auto p = gs.board[r][c];
+
+            if(p.type == EMPTY || p.white != white) continue;
+
+            if(p.type == B) bishops++;
+            if(p.type == N) knights++;
+            if(p.type == R) rooks++;
+            if(p.type == Q) queens++;
+        }
+
+    if(queens > 0) return true;
+    if(rooks > 0) return true;
+    if(bishops >= 2) return true;
+
+    return false;
+}
+
+int matingNet(const GameState& gs)
+{
+    int wr=-1,wc=-1, br=-1,bc=-1;
+
+    for(int r=0;r<8;r++)
+        for(int c=0;c<8;c++){
+            auto p = gs.board[r][c];
+
+            if(p.type==K){
+                if(p.white){ wr=r; wc=c; }
+                else{ br=r; bc=c; }
+            }
+        }
+
+    int score = 0;
+
+    int edgeDist = std::min({br,7-br,bc,7-bc});
+    score += 400 * (3 - edgeDist);
+
+    int kingDist = abs(wr-br) + abs(wc-bc);
+    score += 40 * (14 - kingDist);
+
+    return score;
+}
+
+int oppositionBonus(const GameState& gs)
+{
+    int wr=-1,wc=-1, br=-1,bc=-1;
+
+    for(int r=0;r<8;r++)
+        for(int c=0;c<8;c++){
+            auto p = gs.board[r][c];
+            if(p.type == K){
+                if(p.white){ wr=r; wc=c; }
+                else{ br=r; bc=c; }
+            }
+        }
+
+    int score = 0;
+    if(wc == bc && abs(wr-br) == 2)
+    {
+        if(gs.whiteToMove)
+            score -= 20;
+        else
+            score += 20;
+    }
+    if(wr == br && abs(wc-bc) == 2)
+    {
+        if(gs.whiteToMove)
+            score -= 20;
+        else
+            score += 20;
+    }
+
+    return score;
+}
+
 bool isEndgame(const GameState& gs)
 {
     int material = 0;
@@ -165,7 +245,7 @@ int evaluateMaterial(const GameState& gs)
                 case P: pst = pawnTable[row][c]; break;
                 case N: pst = knightTable[row][c]; break;
                 case B: pst = bishopTable[row][c]; break;
-                case R: pst = rookTable[row][c]; break;
+                case R: pst = rookTable[row][c]; if (endgame) pst += 20; break;
                 case Q: pst = queenTable[row][c]; break;
 
                 case K:
@@ -180,6 +260,16 @@ int evaluateMaterial(const GameState& gs)
 
             score += p.white ? total : -total;
         }
+    }
+    if(endgame)
+    {
+        if(hasMatingMaterial(gs,true))
+            score += matingNet(gs);
+
+        if(hasMatingMaterial(gs,false))
+            score -= matingNet(gs);
+        
+        score += oppositionBonus(gs);
     }
 
     return score;
