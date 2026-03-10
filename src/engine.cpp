@@ -7,6 +7,144 @@
 #include <random>
 #include <chrono>
 
+#define MAX_DEPTH 10
+
+static const int INF = 1000000000;
+
+static int pawnTable[8][8] = {
+{ 0,  0,  0,  0,  0,  0,  0,  0},
+{50, 50, 50, 50, 50, 50, 50, 50},
+{10, 10, 20, 30, 30, 20, 10, 10},
+{ 5,  5, 10, 25, 25, 10,  5,  5},
+{ 0,  0,  0, 20, 20,  0,  0,  0},
+{ 5, -5,-10,  0,  0,-10, -5,  5},
+{ 5, 10, 10,-20,-20, 10, 10,  5},
+{ 0,  0,  0,  0,  0,  0,  0,  0}
+};
+
+static int knightTable[8][8] = {
+{-50,-40,-30,-30,-30,-30,-40,-50},
+{-40,-20,  0,  0,  0,  0,-20,-40},
+{-30,  0, 5, 15, 15, 5,  0,-30},
+{-30,  5, 15, 20, 20, 15,  5,-30},
+{-30,  0, 15, 20, 20, 15,  0,-30},
+{-30,  5, 10, 15, 15, 10,  5,-30},
+{-40,-20,  0,  5,  5,  0,-20,-40},
+{-50,-40,-30,-30,-30,-30,-40,-50}
+};
+
+static int bishopTable[8][8] = {
+{-20,-10,-10,-10,-10,-10,-10,-20},
+{-10,  0,  0,  0,  0,  0,  0,-10},
+{-10,  0,  5, 10, 10,  5,  0,-10},
+{-10,  5,  5, 10, 10,  5,  5,-10},
+{-10,  0, 10, 10, 10, 10,  0,-10},
+{-10, 10, 10, 10, 10, 10, 10,-10},
+{-10,  5,  0,  0,  0,  0,  5,-10},
+{-20,-10,-10,-10,-10,-10,-10,-20}
+};
+
+static int rookTable[8][8] = {
+{ 0,  0,  0,  0,  0,  0,  0,  0},
+{ 5, 10, 10, 10, 10, 10, 10,  5},
+{-5,  0,  0,  0,  0,  0,  0, -5},
+{-5,  0,  0,  0,  0,  0,  0, -5},
+{-5,  0,  0,  0,  0,  0,  0, -5},
+{-5,  0,  0,  0,  0,  0,  0, -5},
+{-5,  0,  0,  0,  0,  0,  0, -5},
+{ 0,  0,  0,  5,  5,  0,  0,  0}
+};
+
+static int queenTable[8][8] = {
+{-20,-10,-10, -5, -5,-10,-10,-20},
+{-10,  0,  0,  0,  0,  0,  0,-10},
+{-10,  0,  5,  5,  5,  5,  0,-10},
+{ -5,  0,  5,  5,  5,  5,  0, -5},
+{  0,  0,  5,  5,  5,  5,  0, -5},
+{-10,  5,  5,  5,  5,  5,  0,-10},
+{-10,  0,  5,  0,  0,  0,  0,-10},
+{-20,-10,-10, -5, -5,-10,-10,-20}
+};
+
+static int kingMiddleTable[8][8] = {
+{-30,-40,-40,-50,-50,-40,-40,-30},
+{-30,-40,-40,-50,-50,-40,-40,-30},
+{-30,-40,-40,-50,-50,-40,-40,-30},
+{-30,-40,-40,-50,-50,-40,-40,-30},
+{-20,-30,-30,-40,-40,-30,-30,-20},
+{-10,-20,-20,-20,-20,-20,-20,-10},
+{ 20, 20,  0,  0,  0,  0, 20, 20},
+{ 20, 30, 10,  0,  0, 10, 30, 20}
+};
+
+static int kingEndTable[8][8] = {
+{-50,-40,-30,-20,-20,-30,-40,-50},
+{-30,-20,-10,  0,  0,-10,-20,-30},
+{-30,-10, 20, 30, 30, 20,-10,-30},
+{-30,-10, 30, 40, 40, 30,-10,-30},
+{-30,-10, 30, 40, 40, 30,-10,-30},
+{-30,-10, 20, 30, 30, 20,-10,-30},
+{-30,-30,  0,  0,  0,  0,-30,-30},
+{-50,-30,-30,-30,-30,-30,-30,-50}
+};
+
+int pieceValue(int pt)
+{
+    switch (pt) {
+    case P:
+        return 100;
+    case N:
+        return 320;
+    case B:
+        return 330;
+    case R:
+        return 500;
+    case Q:
+        return 900;
+    case K:
+        return 20000;
+    default:
+        return 0;
+    }
+}
+
+bool isEndgame(const GameState& gs)
+{
+    int material = 0;
+
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++) {
+            auto p = gs.board[r][c];
+            if (p.type == Q)
+                return false;
+
+            if (p.type != EMPTY && p.type != K)
+                material += pieceValue(p.type);
+        }
+
+    return material < 2000;
+}
+
+int moveScore(const GameState& gs, const Move& m)
+{
+    int score = 0;
+
+    if (m.captured.has_value()) {
+        int victim = pieceValue(m.captured->type);
+        int attacker = pieceValue(gs.board[m.sx][m.sy].type);
+        // higher victim, lower attacker -> better
+        score += 10000 + (victim * 10) - attacker;
+    }
+
+    if (m.promotion)
+        score += 8000;
+    if (m.isCastle)
+        score += 100;
+
+    return score;
+}
+
+
 int evaluateMaterial(const GameState& gs)
 {
     int score = 0;
@@ -114,9 +252,9 @@ int minimax(GameState gs, int depth, int alpha, int beta, bool maximizingPlayer)
     auto moves = generateLegalMoves(gs);
     if (moves.empty()) {
         if (isInCheck(gs, gs.whiteToMove)) {
-            return maximizingPlayer ? -1000000 + (10 - depth): 1000000 - (10 - depth);
+            return maximizingPlayer ? -1000000 + (MAX_DEPTH - depth): 1000000 - (MAX_DEPTH - depth);
         } else {
-            return maximizingPlayer ? -300 : 300;
+            return maximizingPlayer ? -400 : 400;
         }
     }
     
