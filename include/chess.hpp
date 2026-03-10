@@ -1,12 +1,10 @@
 #pragma once
-
 #include <array>
 #include <vector>
 #include <string>
 #include <optional>
 #include <map>
 
-// -- Basic types --
 enum PieceType {
     EMPTY = 0,
     P = 1,
@@ -43,8 +41,8 @@ struct GameState {
     std::vector<Move> history;
     int halfmoveClock = 0;
     int fullmoveNumber = 1;
-    std::map<std::string, int> positionCounts; 
-    std::string initialFen; 
+    std::map<std::string, int> positionCounts;
+    std::string initialFen;
 
     void initStandard();
     void loadFromFen(const std::string& fen);
