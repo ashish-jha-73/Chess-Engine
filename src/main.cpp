@@ -34,6 +34,7 @@ void clearSelection(optional<pair<int, int>>& selectedSquare, vector<Move>& lega
 
 int main()
 {
+    initEngine();
     GameState gs;
     gs.initStandard();
 
@@ -83,7 +84,7 @@ int main()
     mutex aiMoveMutex;
 
     bool aiEnabled = false, aiPlaysWhite = false;
-    const int aiDepth = 4;
+    const int aiDepth = 5;
     optional<string> gameOverMsg = nullopt;
     optional<pair<int, int>> selectedSquare;
     vector<Move> legalMovesForSelected;

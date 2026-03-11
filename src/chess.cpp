@@ -21,7 +21,6 @@ std::vector<std::string> split(const std::string& s, char delimiter)
 
 void GameState::loadFromFen(const std::string& fen)
 {
-    // Clear all previous state
     board.fill({});
     history.clear();
     positionCounts.clear();

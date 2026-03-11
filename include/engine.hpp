@@ -3,3 +3,4 @@
 #include "chess.hpp"
 
 Move computeBestMove(GameState gs, int depth);
+void initEngine();
