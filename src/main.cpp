@@ -83,7 +83,7 @@ int main()
     mutex aiMoveMutex;
 
     bool aiEnabled = false, aiPlaysWhite = false;
-    const int aiDepth = 4;
+    const int aiDepth = 7;
     optional<string> gameOverMsg = nullopt;
     optional<pair<int, int>> selectedSquare;
     vector<Move> legalMovesForSelected;
