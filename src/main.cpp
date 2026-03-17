@@ -8,6 +8,8 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <vector>
+#include <string>
 
 #include "../include/chess.hpp"
 #include "../include/engine.hpp"
@@ -32,8 +34,55 @@ void clearSelection(optional<pair<int, int>>& selectedSquare, vector<Move>& lega
     isDragging = false;
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        int depth = 7;
+        int timeLimitMs = 2000;
+        if (argc > 2) {
+            depth = std::max(1, std::atoi(argv[2]));
+        }
+        if (argc > 3) {
+            timeLimitMs = std::max(100, std::atoi(argv[3]));
+        }
+
+        const std::vector<std::string> fens = {
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bq1rk1/ppp2ppp/2np1n2/3Np3/2B1P3/5N2/PPP2PPP/R1BQ1RK1 w - - 0 8",
+            "8/2p5/3p4/1p1P4/1P3k2/2P2P2/6K1/8 w - - 0 40",
+            "2r2rk1/1bq1bppp/p2ppn2/1pn5/3NP3/1BN1BP2/PPQ2P1P/2RR2K1 w - - 0 14",
+            "r4rk1/1pp1qppp/p1np1n2/4p3/2B1P3/2NP1N2/PPP2PPP/R1BQR1K1 w - - 2 11"
+        };
+
+        long long totalNodes = 0;
+        long long totalTimeMs = 0;
+
+        std::cout << "bench depth=" << depth << " timeLimitMs=" << timeLimitMs << "\n";
+        for (size_t i = 0; i < fens.size(); ++i) {
+            GameState benchState;
+            benchState.loadFromFen(fens[i]);
+            (void)computeBestMove(benchState, depth, timeLimitMs);
+            const SearchStats stats = getLastSearchStats();
+            totalNodes += stats.nodes;
+            totalTimeMs += stats.timeMs;
+
+            std::cout << "pos " << (i + 1)
+                      << "  nodes " << stats.nodes
+                      << "  timeMs " << stats.timeMs
+                      << "  nps " << static_cast<long long>(stats.nps)
+                      << "  depth " << stats.depthReached
+                      << "  score " << stats.bestScore << "\n";
+        }
+
+        const double totalNps = (totalTimeMs > 0)
+            ? (static_cast<double>(totalNodes) * 1000.0 / static_cast<double>(totalTimeMs))
+            : 0.0;
+        std::cout << "total nodes " << totalNodes
+                  << "  totalTimeMs " << totalTimeMs
+                  << "  totalNps " << static_cast<long long>(totalNps) << "\n";
+        return 0;
+    }
+
     GameState gs;
     gs.initStandard();
 
@@ -83,7 +132,7 @@ int main()
     mutex aiMoveMutex;
 
     bool aiEnabled = false, aiPlaysWhite = false;
-    const int aiDepth = 7;
+    const int aiDepth = 12;
     optional<string> gameOverMsg = nullopt;
     optional<pair<int, int>> selectedSquare;
     vector<Move> legalMovesForSelected;
@@ -123,10 +172,10 @@ int main()
     });
     addButton("Undo", 60, [&]() {
         if (isAIThinking) return;
-        if (gs.history.empty()) return;
+        if (gs.undoTop <= 0) return;
         if (aiEnabled) {
             undoMove(gs);
-            if (!gs.history.empty()) {
+            if (gs.undoTop > 0) {
                 undoMove(gs);
             }
         } else {
@@ -208,7 +257,7 @@ int main()
                         for (auto const& [type, sprite] : promotionSprites) {
                             if (sprite.getGlobalBounds().contains(sf::Vector2f((float)mp.x, (float)mp.y))) {
                                 Move finalMove = *pendingPromotionMove;
-                                finalMove.promotionType = type;
+                                finalMove.setPromotionType(static_cast<std::uint8_t>(type));
                                 makeMove(gs, finalMove);
                                 gameOverMsg = checkGameOver(gs);
                                 choosingPromotion = false;
@@ -226,7 +275,7 @@ int main()
                             } else if (selectedSquare.has_value()) {
                                 optional<Move> theMove;
                                 for (const auto& legalMove : legalMovesForSelected) {
-                                    if (legalMove.to == r * 8 + c) {
+                                    if (legalMove.to() == r * 8 + c) {
                                         theMove = legalMove;
                                         break;
                                     }
@@ -244,21 +293,23 @@ int main()
                                     }
                                 } else {
                                     clearSelection(selectedSquare, legalMovesForSelected, isDragging);
-                                    if (gs.board[r][c].type != EMPTY && gs.board[r][c].white == gs.whiteToMove) { // Fall-through
+                                    const Piece p = pieceAt(gs, r, c);
+                                    if (p.type != EMPTY && p.white == gs.whiteToMove) { // Fall-through
                                     } else {
                                         continue;
                                     }
                                 }
                             }
-                            if (!selectedSquare.has_value() && gs.board[r][c].type != EMPTY && gs.board[r][c].white == gs.whiteToMove && (!aiEnabled || gs.whiteToMove != aiPlaysWhite)) {
+                            const Piece selectedPiece = pieceAt(gs, r, c);
+                            if (!selectedSquare.has_value() && selectedPiece.type != EMPTY && selectedPiece.white == gs.whiteToMove && (!aiEnabled || gs.whiteToMove != aiPlaysWhite)) {
                                 selectedSquare = make_pair(r, c);
                                 auto allLegalMoves = generateLegalMoves(gs);
                                 for (const auto& m : allLegalMoves) {
-                                    if (m.from == r * 8 + c)
+                                    if (m.from() == r * 8 + c)
                                         legalMovesForSelected.push_back(m);
                                 }
                                 dragStartPos = mp;
-                                Piece p = gs.board[r][c];
+                                Piece p = selectedPiece;
                                 string key = p.white ? "w" : "b";
                                 switch (p.type) {
                                 case P: key += "p"; break;
@@ -292,7 +343,7 @@ int main()
                         if (inBounds(r, c)) {
                             optional<Move> theMove;
                             for (const auto& legalMove : legalMovesForSelected) {
-                                if (legalMove.to == r * 8 + c) {
+                                if (legalMove.to() == r * 8 + c) {
                                     theMove = legalMove;
                                     break;
                                 }
@@ -340,8 +391,8 @@ int main()
             bool isDuplicatePromotion = false;
             if (move.isPromotion()) {
                 for (const auto& m2 : legalMovesForSelected) {
-                    if (&move != &m2 && move.to == m2.to) {
-                        if (move.promotionType > m2.promotionType) {
+                    if (&move != &m2 && move.to() == m2.to()) {
+                        if (move.promotionType() > m2.promotionType()) {
                             isDuplicatePromotion = true;
                             break;
                         }
@@ -349,8 +400,8 @@ int main()
                 }
             }
             if (!isDuplicatePromotion) {
-                const int moveRow = move.to / 8;
-                const int moveCol = move.to % 8;
+                const int moveRow = move.to() / 8;
+                const int moveCol = move.to() % 8;
                 moveHint.setPosition({(float)moveCol * 80.f + 40.f - 15.f, (float)boardYOffset + moveRow * 80.f + 40.f - 15.f});
                 window.draw(moveHint);
             }
@@ -359,7 +410,7 @@ int main()
             for (int c = 0; c < 8; c++) {
                 if (isDragging && selectedSquare.has_value() && selectedSquare->first == r && selectedSquare->second == c)
                     continue;
-                Piece p = gs.board[r][c];
+                Piece p = pieceAt(gs, r, c);
                 if (p.type != EMPTY) {
                     string key = p.white ? "w" : "b";
                     switch (p.type) {
