@@ -354,7 +354,7 @@ void GameState::loadFromFen(const std::string& fen)
 
 void GameState::initStandard()
 {
-    loadFromFen("2K2BN1/8/8/8/8/8/2k5/8 w - - 0 1");
+    loadFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 }
 
 bool isSquareAttacked(const GameState& gs, int r, int c, bool byWhite)

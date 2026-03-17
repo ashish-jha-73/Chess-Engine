@@ -217,6 +217,9 @@ struct SearchState {
     std::array<uint64_t, 1024> hashHistory{};
     int hashCount = 0;
     int  nodes = 0;
+    std::array<int, 1024> evalCoreNoKingStack{};
+    int evalPly = 0;
+    bool evalActive = false;
     bool stopped = false;
     std::chrono::steady_clock::time_point startTime;
     int  timeLimitMs = 5000;
@@ -224,6 +227,8 @@ struct SearchState {
     void clear() {
         nodes = 0;
         hashCount = 0;
+        evalPly = 0;
+        evalActive = false;
         stopped = false;
         for (auto& ply : killers)
             for (auto& k : ply)
@@ -467,6 +472,135 @@ static int bishopPairBonus(const GameState& gs)
     return (wb >= 2 ? 30 : 0) - (bb >= 2 ? 30 : 0);
 }
 
+static int pieceSquareTableScore(bool white, int type, int sq)
+{
+    const int r = rowOfSq(sq);
+    const int c = colOfSq(sq);
+    const int row = white ? r : 7 - r;
+
+    switch (type) {
+        case P: return pawnTable[row][c];
+        case N: return knightTable[row][c];
+        case B: return bishopTable[row][c];
+        case R: return rookTable[row][c];
+        case Q: return queenTable[row][c];
+        default: return 0;
+    }
+}
+
+static int pieceContributionNoKing(bool white, int type, int sq)
+{
+    if (type == EMPTY || type == K) {
+        return 0;
+    }
+    const int v = pieceValue(type) + pieceSquareTableScore(white, type, sq);
+    return white ? v : -v;
+}
+
+static int computeCoreEvalNoKing(const GameState& gs)
+{
+    int score = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+        const Piece p = pieceAtSq(gs, sq);
+        if (p.type == EMPTY || p.type == K) {
+            continue;
+        }
+        score += pieceContributionNoKing(p.white, p.type, sq);
+    }
+    return score;
+}
+
+static int kingPstScore(const GameState& gs, bool eg)
+{
+    const int wKingSq = lsbSquare64(gs.bitboards[0][K - 1]);
+    const int bKingSq = lsbSquare64(gs.bitboards[1][K - 1]);
+
+    const int wr = rowOfSq(wKingSq), wc = colOfSq(wKingSq);
+    const int br = rowOfSq(bKingSq), bc = colOfSq(bKingSq);
+    const int wRow = wr;
+    const int bRow = 7 - br;
+
+    const int wPst = eg ? kingEndTable[wRow][wc] : kingMiddleTable[wRow][wc];
+    const int bPst = eg ? kingEndTable[bRow][bc] : kingMiddleTable[bRow][bc];
+    return wPst - bPst;
+}
+
+static int rookEndgameOffset(const GameState& gs)
+{
+    return 10 * (popcount64(gs.bitboards[0][R - 1]) - popcount64(gs.bitboards[1][R - 1]));
+}
+
+static int computeMoveCoreDeltaNoKing(const GameState& gs, const Move& m)
+{
+    int delta = 0;
+    const int fromSq = m.from();
+    const int toSq = m.to();
+    const int fromR = rowOfSq(fromSq);
+    const int fromC = colOfSq(fromSq);
+    const int toR = rowOfSq(toSq);
+    const int toC = colOfSq(toSq);
+
+    const Piece moving = pieceAtSq(gs, fromSq);
+    if (moving.type != EMPTY && moving.type != K) {
+        delta -= pieceContributionNoKing(moving.white, moving.type, fromSq);
+        if (m.isPromotion()) {
+            delta += pieceContributionNoKing(moving.white, m.promotionType(), toSq);
+        } else {
+            delta += pieceContributionNoKing(moving.white, moving.type, toSq);
+        }
+    }
+
+    if (m.isEnPassant()) {
+        const int capSq = fromR * 8 + toC;
+        const Piece captured = pieceAtSq(gs, capSq);
+        if (captured.type != EMPTY && captured.type != K) {
+            delta -= pieceContributionNoKing(captured.white, captured.type, capSq);
+        }
+    } else {
+        const Piece captured = pieceAtSq(gs, toSq);
+        if (captured.type != EMPTY && captured.type != K) {
+            delta -= pieceContributionNoKing(captured.white, captured.type, toSq);
+        }
+    }
+
+    if (m.isCastle()) {
+        if (toC == 6) {
+            const int rookFrom = toR * 8 + 7;
+            const int rookTo = toR * 8 + 5;
+            delta -= pieceContributionNoKing(moving.white, R, rookFrom);
+            delta += pieceContributionNoKing(moving.white, R, rookTo);
+        } else {
+            const int rookFrom = toR * 8 + 0;
+            const int rookTo = toR * 8 + 3;
+            delta -= pieceContributionNoKing(moving.white, R, rookFrom);
+            delta += pieceContributionNoKing(moving.white, R, rookTo);
+        }
+    }
+
+    (void)fromC;
+    return delta;
+}
+
+static inline void searchMakeMove(GameState& gs, const Move& m)
+{
+    if (ss.evalActive && ss.evalPly + 1 < static_cast<int>(ss.evalCoreNoKingStack.size())) {
+        const int delta = computeMoveCoreDeltaNoKing(gs, m);
+        ss.evalCoreNoKingStack[ss.evalPly + 1] = ss.evalCoreNoKingStack[ss.evalPly] + delta;
+        ++ss.evalPly;
+    } else {
+        ss.evalActive = false;
+    }
+    makeMove(gs, m, false);
+}
+
+static inline void searchUndoMove(GameState& gs)
+{
+    undoMove(gs, false);
+    if (ss.evalPly > 0) {
+        --ss.evalPly;
+    }
+}
+
 static bool isKRK(const GameState& gs, bool whiteHasRook)
 {
     const int strong = whiteHasRook ? 0 : 1;
@@ -675,39 +809,13 @@ static int kqkFamilyBonus(const GameState& gs, bool whiteHasQueen)
 
 static int evaluate(const GameState& gs)
 {
-    int score = 0;
+    int score = ss.evalActive ? ss.evalCoreNoKingStack[ss.evalPly] : computeCoreEvalNoKing(gs);
     bool eg = isEndgame(gs);
 
-    auto addPieces = [&](bool white, int type, const int table[8][8]) {
-        int side = white ? 0 : 1;
-        uint64_t bb = gs.bitboards[side][type - 1];
-        while (bb) {
-            const int sq = lsbSquare64(popLsb64(bb));
-            const int r = rowOfSq(sq);
-            const int c = colOfSq(sq);
-            const int row = white ? r : 7 - r;
-            int pst = table[row][c];
-            if (type == R && eg) {
-                pst += 10;
-            }
-            const int total = pieceValue(type) + pst;
-            score += white ? total : -total;
-        }
-    };
-
-    addPieces(true, P, pawnTable);
-    addPieces(true, N, knightTable);
-    addPieces(true, B, bishopTable);
-    addPieces(true, R, rookTable);
-    addPieces(true, Q, queenTable);
-    addPieces(true, K, eg ? kingEndTable : kingMiddleTable);
-
-    addPieces(false, P, pawnTable);
-    addPieces(false, N, knightTable);
-    addPieces(false, B, bishopTable);
-    addPieces(false, R, rookTable);
-    addPieces(false, Q, queenTable);
-    addPieces(false, K, eg ? kingEndTable : kingMiddleTable);
+    score += kingPstScore(gs, eg);
+    if (eg) {
+        score += rookEndgameOffset(gs);
+    }
 
     score += pawnStructureScore(gs);
     score += rookOpenFileBonus(gs);
@@ -795,6 +903,30 @@ static void updateHistory(const GameState& gs, const Move& m, int depth)
     }
 }
 
+static void generateTacticalLegalMoves(GameState& gs, MoveList& out)
+{
+    out.clear();
+
+    MoveList pseudo;
+    generatePseudoLegalMoves(gs, pseudo);
+    const bool sideToCheck = gs.whiteToMove;
+
+    for (int i = 0; i < pseudo.count; ++i) {
+        const Move& m = pseudo.moves[i];
+        if (!m.isCapture() && !m.isPromotion()) {
+            continue;
+        }
+
+        makeMove(gs, m, false);
+        const bool legal = !isInCheck(gs, sideToCheck);
+        undoMove(gs, false);
+
+        if (legal && out.count < static_cast<int>(out.moves.size())) {
+            out.moves[out.count++] = m;
+        }
+    }
+}
+
 static int quiescence(GameState& gs, int alpha, int beta, int ply)
 {
     ss.nodes++;
@@ -813,9 +945,9 @@ static int quiescence(GameState& gs, int alpha, int beta, int ply)
 
         for (int i = 0; i < evasions.count; ++i) {
             Move& m = evasions.moves[i];
-            makeMove(gs, m, false);
+            searchMakeMove(gs, m);
             int score = -quiescence(gs, -beta, -alpha, ply + 1);
-            undoMove(gs, false);
+            searchUndoMove(gs);
 
             if (score >= beta) return beta;
             if (score > alpha) alpha = score;
@@ -829,19 +961,16 @@ static int quiescence(GameState& gs, int alpha, int beta, int ply)
     if (stand_pat > alpha)  alpha = stand_pat;
 
     MoveList moves;
-    generateLegalMoves(gs, moves);
+    generateTacticalLegalMoves(gs, moves);
 
     Move dummy = invalidMove();
     sortMoves(moves, gs, 0, dummy);
 
     for (int i = 0; i < moves.count; ++i) {
         Move& m = moves.moves[i];
-        if (!m.isCapture() && !m.isPromotion())
-            continue;
-
-        makeMove(gs, m, false);
+        searchMakeMove(gs, m);
         int score = -quiescence(gs, -beta, -alpha, ply + 1);
-        undoMove(gs, false);
+        searchUndoMove(gs);
 
         if (score >= beta) return beta;
         if (score > alpha)  alpha = score;
@@ -879,18 +1008,31 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
         ttBestMove = entry->bestMove;
     }
 
+    const bool inCheck = isInCheck(gs, gs.whiteToMove);
+
     if (depth == 0) return quiescence(gs, alpha, beta, ply);
+
+    int staticEval = 0;
+    if (!inCheck) {
+        staticEval = evaluate(gs);
+        if (depth <= 2) {
+            const int rfpMargin = 120 * depth;
+            if (staticEval - rfpMargin >= beta) {
+                return staticEval;
+            }
+        }
+    }
 
     MoveList moves;
     generateLegalMoves(gs, moves);
 
     if (moves.empty()) {
-        if (isInCheck(gs, gs.whiteToMove))
+        if (inCheck)
             return -(MATE_SCORE - ply);   
         return DRAW_SCORE;
     }
 
-    if (nullMoveAllowed && depth >= 3 && !isInCheck(gs, gs.whiteToMove) && !isEndgame(gs))
+    if (nullMoveAllowed && depth >= 3 && !inCheck && !isEndgame(gs))
     {
         gs.whiteToMove = !gs.whiteToMove;
         int R = (depth >= 6) ? 3 : 2;
@@ -907,11 +1049,21 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
     Move bestMove = moves.moves[0];
     int  bestScore = -INF;
     int  moveCount = 0;
+    const bool useFutility = !inCheck && depth <= 2;
+    const int futilityBase = staticEval;
 
     for (int i = 0; i < moves.count; ++i) {
         Move& m = moves.moves[i];
         moveCount++;
-        makeMove(gs, m, false);
+
+        if (useFutility && moveCount > 1 && !m.isCapture() && !m.isPromotion()) {
+            const int futilityMargin = 100 * depth;
+            if (futilityBase + futilityMargin <= alpha) {
+                continue;
+            }
+        }
+
+        searchMakeMove(gs, m);
 
         int score;
         if (moveCount > 4 && depth >= 3 && !m.isCapture() && !m.isPromotion() && !isInCheck(gs, gs.whiteToMove)) {
@@ -930,7 +1082,7 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             }
         }
 
-        undoMove(gs, false);
+        searchUndoMove(gs);
 
         if (ss.stopped) return 0;
 
@@ -971,6 +1123,9 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
     ss.startTime   = std::chrono::steady_clock::now();
     ss.timeLimitMs = timeLimitMs;
     ss.hashHistory[ss.hashCount++] = computeHash(gs);
+    ss.evalActive = true;
+    ss.evalPly = 0;
+    ss.evalCoreNoKingStack[0] = computeCoreEvalNoKing(gs);
 
     if (isEndgame(gs)) maxDepth += 6;
     if (isKQKFamily(gs, true) || isKQKFamily(gs, false)) maxDepth += 2;
@@ -985,7 +1140,6 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
         int alpha = -INF, beta = INF;
         Move currentBest = moves.moves[0];
         int  currentBestScore = -INF;
-
         uint64_t hash = computeHash(gs);
         TTEntry* e = tt.probe(hash);
         Move ttMove = (e && e->bestMove.from() < 64)
@@ -995,7 +1149,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 
         for (int i = 0; i < moves.count; ++i) {
             Move& m = moves.moves[i];
-            makeMove(gs, m, false);
+            searchMakeMove(gs, m);
 
             bool createsImmediateThreefold = false;
             const std::string childPos = boardToString(gs);
@@ -1018,7 +1172,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
                 }
             }
 
-            undoMove(gs, false);
+            searchUndoMove(gs);
 
             if (ss.stopped) goto done;
 
