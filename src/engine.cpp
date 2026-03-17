@@ -525,9 +525,9 @@ static int phaseDepthBonus(const GameState& gs)
 
     // Opening -> middlegame -> middle-endgame -> endgame.
     if (npm >= 5200) return 0;
-    if (npm >= 3600) return 2;
-    if (npm >= 2200) return 4;
-    return 6;
+    if (npm >= 3600) return 1;
+    if (npm >= 2200) return 2;
+    return 3;
 }
 
 static int matingNetBonus(const GameState& gs, bool whiteWins)
@@ -1701,8 +1701,6 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
     ss.evalCoreNoKingStack[0] = computeCoreEvalNoKing(gs);
 
     maxDepth += phaseDepthBonus(gs);
-    if (isKQKFamily(gs, true) || isKQKFamily(gs, false)) maxDepth += 2;
-
     const int rootEval = evaluate(gs);
 
     Move bestMove = moves.moves[0];
