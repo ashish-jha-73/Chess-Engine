@@ -4,7 +4,7 @@
 #include <vector>
 #include <string>
 #include <optional>
-#include <map>
+#include <unordered_map>
 
 enum PieceType : std::uint8_t {
     EMPTY = 0,
@@ -128,6 +128,7 @@ struct UndoState {
 Piece pieceAt(const GameState& gs, int r, int c);
 Piece pieceAtSq(const GameState& gs, int sq);
 std::string boardToString(const GameState& gs);
+std::uint64_t positionHash(const GameState& gs);
 
 struct GameState {
     std::array<std::array<Bitboard, 6>, 2> bitboards{};
@@ -142,7 +143,7 @@ struct GameState {
     int undoTop = 0;
     int halfmoveClock = 0;
     int fullmoveNumber = 1;
-    std::map<std::string, int> positionCounts;
+    std::unordered_map<std::uint64_t, int> positionHashCounts;
     std::string initialFen;
 
     void initStandard();

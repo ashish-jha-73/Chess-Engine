@@ -9,6 +9,8 @@
 #include <limits>
 #include <optional>
 #include <random>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 static constexpr int INF         =  1000000000;
@@ -31,6 +33,11 @@ inline Move invalidMove()
     Move m;
     m.value = 0xFFFFFFFFu;
     return m;
+}
+
+inline bool isValidMove(const Move& m)
+{
+    return m.value != 0xFFFFFFFFu;
 }
 
 static constexpr int MAX_PLY     = 64;   
@@ -251,6 +258,187 @@ struct SearchState {
 
 static SearchStats lastSearchStats;
 
+static int squareFromCoord(const std::string& s, int start)
+{
+    if (start + 1 >= static_cast<int>(s.size())) return -1;
+    const int file = s[start] - 'a';
+    const int rank = s[start + 1] - '1';
+    if (file < 0 || file > 7 || rank < 0 || rank > 7) return -1;
+    const int row = 7 - rank;
+    return row * 8 + file;
+}
+
+static bool moveMatchesUci(const Move& m, const std::string& uci)
+{
+    if (uci.size() < 4) return false;
+    const int from = squareFromCoord(uci, 0);
+    const int to = squareFromCoord(uci, 2);
+    if (from < 0 || to < 0) return false;
+    if (m.from() != from || m.to() != to) return false;
+
+    if (uci.size() >= 5) {
+        if (!m.isPromotion()) return false;
+        char p = static_cast<char>(std::tolower(static_cast<unsigned char>(uci[4])));
+        int pt = Q;
+        if (p == 'n') pt = N;
+        else if (p == 'b') pt = B;
+        else if (p == 'r') pt = R;
+        else if (p == 'q') pt = Q;
+        return m.promotionType() == pt;
+    }
+
+    return !m.isPromotion() || m.promotionType() == Q;
+}
+
+static bool sameMoveIdentity(const Move& a, const Move& b)
+{
+    if (a.from() != b.from() || a.to() != b.to()) {
+        return false;
+    }
+    if (a.isPromotion() != b.isPromotion()) {
+        return false;
+    }
+    if (a.isPromotion() && a.promotionType() != b.promotionType()) {
+        return false;
+    }
+    return true;
+}
+
+static bool findLegalMoveByUci(GameState& gs, const std::string& uci, Move& out)
+{
+    MoveList legal;
+    generateLegalMoves(gs, legal);
+    for (int i = 0; i < legal.count; ++i) {
+        if (moveMatchesUci(legal.moves[i], uci)) {
+            out = legal.moves[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void addBookLine(std::unordered_map<std::uint64_t, std::vector<Move>>& book,
+                        const std::vector<std::string>& line)
+{
+    GameState gs;
+    gs.initStandard();
+
+    for (const std::string& uci : line) {
+        Move m;
+        if (!findLegalMoveByUci(gs, uci, m)) {
+            break;
+        }
+
+        const std::uint64_t h = positionHash(gs);
+        auto& options = book[h];
+        bool exists = false;
+        for (const Move& o : options) {
+            if (sameMoveIdentity(o, m)) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            options.push_back(m);
+        }
+
+        makeMove(gs, m, false);
+    }
+}
+
+static const std::unordered_map<std::uint64_t, std::vector<Move>>& openingBook()
+{
+    static const std::unordered_map<std::uint64_t, std::vector<Move>> book = [] {
+        std::unordered_map<std::uint64_t, std::vector<Move>> b;
+
+        addBookLine(b, {"e2e4","e7e5","g1f3","b8c6","f1c4","g8f6","d2d3","f8c5"});
+        addBookLine(b, {"e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6"});
+        addBookLine(b, {"e2e4","e7e6","d2d4","d7d5","b1c3","g8f6","c1g5","f8e7"});
+        addBookLine(b, {"d2d4","d7d5","c2c4","e7e6","b1c3","g8f6","c1g5","f8e7"});
+        addBookLine(b, {"d2d4","g8f6","c2c4","e7e6","g1f3","d7d5","b1c3","f8e7"});
+        addBookLine(b, {"c2c4","e7e5","b1c3","g8f6","g2g3","d7d5","c4d5","f6d5"});
+        addBookLine(b, {"g1f3","d7d5","d2d4","g8f6","c2c4","e7e6","b1c3","f8e7"});
+        addBookLine(b, {"e2e4","e7e5","g1f3","g8f6","f3e5","d7d6","e5f3","f6e4"});
+
+        return b;
+    }();
+
+    return book;
+}
+
+static Move bookMoveForPosition(GameState& gs)
+{
+    const int ply = (gs.fullmoveNumber - 1) * 2 + (gs.whiteToMove ? 0 : 1);
+    if (ply >= 12) {
+        return invalidMove();
+    }
+
+    const auto& book = openingBook();
+    const std::uint64_t h = positionHash(gs);
+    auto it = book.find(h);
+    if (it == book.end() || it->second.empty()) {
+        return invalidMove();
+    }
+
+    MoveList legal;
+    generateLegalMoves(gs, legal);
+    for (const Move& bm : it->second) {
+        for (int i = 0; i < legal.count; ++i) {
+            if (sameMoveIdentity(legal.moves[i], bm)) {
+                return legal.moves[i];
+            }
+        }
+    }
+
+    return invalidMove();
+}
+
+struct PawnEvalEntry {
+    uint64_t key = 0;
+    int pawnStructure = 0;
+    int rookOpenFile = 0;
+};
+
+static constexpr size_t PAWN_EVAL_SIZE = 1 << 19;
+
+struct PawnEvalCache {
+    std::vector<PawnEvalEntry> table;
+
+    PawnEvalCache() : table(PAWN_EVAL_SIZE) {}
+
+    static uint64_t makeKey(const GameState& gs)
+    {
+        uint64_t w = gs.bitboards[0][P - 1];
+        uint64_t b = gs.bitboards[1][P - 1];
+
+        // splitmix64-style mixing for a compact pawn signature.
+        auto mix = [](uint64_t x) {
+            x += 0x9e3779b97f4a7c15ULL;
+            x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+            return x ^ (x >> 31);
+        };
+
+        uint64_t key = mix(w) ^ (mix(b) << 1);
+        if (key == 0) key = 1;
+        return key;
+    }
+
+    PawnEvalEntry* probe(uint64_t key)
+    {
+        PawnEvalEntry* e = &table[key & (PAWN_EVAL_SIZE - 1)];
+        return (e->key == key) ? e : nullptr;
+    }
+
+    void store(uint64_t key, int pawnStructure, int rookOpenFile)
+    {
+        PawnEvalEntry& e = table[key & (PAWN_EVAL_SIZE - 1)];
+        e.key = key;
+        e.pawnStructure = pawnStructure;
+        e.rookOpenFile = rookOpenFile;
+    }
+} static pawnEvalCache;
+
 static inline int scoreToTT(int score, int ply)
 {
     if (score > MATE_SCORE - MAX_PLY) return score + ply;
@@ -326,6 +514,22 @@ static bool isEndgame(const GameState& gs)
     return mat < 1800;
 }
 
+static int phaseDepthBonus(const GameState& gs)
+{
+    // Use non-pawn material as a cheap phase proxy.
+    int npm = 0;
+    npm += pieceValue(N) * (popcount64(gs.bitboards[0][N - 1]) + popcount64(gs.bitboards[1][N - 1]));
+    npm += pieceValue(B) * (popcount64(gs.bitboards[0][B - 1]) + popcount64(gs.bitboards[1][B - 1]));
+    npm += pieceValue(R) * (popcount64(gs.bitboards[0][R - 1]) + popcount64(gs.bitboards[1][R - 1]));
+    npm += pieceValue(Q) * (popcount64(gs.bitboards[0][Q - 1]) + popcount64(gs.bitboards[1][Q - 1]));
+
+    // Opening -> middlegame -> middle-endgame -> endgame.
+    if (npm >= 5200) return 0;
+    if (npm >= 3600) return 2;
+    if (npm >= 2200) return 4;
+    return 6;
+}
+
 static int matingNetBonus(const GameState& gs, bool whiteWins)
 {
     const int wKingSq = lsbSquare64(gs.bitboards[0][K - 1]);
@@ -370,7 +574,7 @@ static uint8_t pawnFileMask(const GameState& gs, bool white)
     return mask;
 }
 
-static int pawnStructureScore(const GameState& gs)
+static int pawnStructureScoreRaw(const GameState& gs)
 {
     int score = 0;
 
@@ -435,7 +639,7 @@ static int pawnStructureScore(const GameState& gs)
     return score;
 }
 
-static int rookOpenFileBonus(const GameState& gs)
+static int rookOpenFileBonusRaw(const GameState& gs)
 {
     int score = 0;
     uint8_t wFiles = pawnFileMask(gs, true);
@@ -465,11 +669,145 @@ static int rookOpenFileBonus(const GameState& gs)
     return score;
 }
 
+static void pawnEvalTerms(const GameState& gs, int& pawnStructure, int& rookOpenFile)
+{
+    const uint64_t key = PawnEvalCache::makeKey(gs);
+    if (PawnEvalEntry* e = pawnEvalCache.probe(key)) {
+        pawnStructure = e->pawnStructure;
+        rookOpenFile = e->rookOpenFile;
+        return;
+    }
+
+    pawnStructure = pawnStructureScoreRaw(gs);
+    rookOpenFile = rookOpenFileBonusRaw(gs);
+    pawnEvalCache.store(key, pawnStructure, rookOpenFile);
+}
+
 static int bishopPairBonus(const GameState& gs)
 {
     const int wb = popcount64(gs.bitboards[0][B - 1]);
     const int bb = popcount64(gs.bitboards[1][B - 1]);
     return (wb >= 2 ? 30 : 0) - (bb >= 2 ? 30 : 0);
+}
+
+static int openingPrinciplesScore(const GameState& gs)
+{
+    // Opening guidance: faster development, center control, avoid premature queen moves.
+    int score = 0;
+
+    auto sideScore = [&](bool white) {
+        int sideScore = 0;
+        const int side = white ? 0 : 1;
+
+        const int knightHome1 = white ? 57 : 1; // b1 / b8
+        const int knightHome2 = white ? 62 : 6; // g1 / g8
+        const int bishopHome1 = white ? 58 : 2; // c1 / c8
+        const int bishopHome2 = white ? 61 : 5; // f1 / f8
+        const int queenHome = white ? 59 : 3;   // d1 / d8
+
+        int undevelopedMinor = 0;
+        if (pieceAtSq(gs, knightHome1).type == N && pieceAtSq(gs, knightHome1).white == white) undevelopedMinor++;
+        if (pieceAtSq(gs, knightHome2).type == N && pieceAtSq(gs, knightHome2).white == white) undevelopedMinor++;
+        if (pieceAtSq(gs, bishopHome1).type == B && pieceAtSq(gs, bishopHome1).white == white) undevelopedMinor++;
+        if (pieceAtSq(gs, bishopHome2).type == B && pieceAtSq(gs, bishopHome2).white == white) undevelopedMinor++;
+        sideScore -= undevelopedMinor * 12;
+
+        const Piece qHome = pieceAtSq(gs, queenHome);
+        if (!(qHome.type == Q && qHome.white == white) && undevelopedMinor >= 2) {
+            sideScore -= 20;
+        }
+
+        // Reward central pawn presence/advance (d/e files).
+        const int dSq = white ? 51 : 11; // d2 / d7
+        const int eSq = white ? 52 : 12; // e2 / e7
+        const Piece dPawn = pieceAtSq(gs, dSq);
+        const Piece ePawn = pieceAtSq(gs, eSq);
+        if (!(dPawn.type == P && dPawn.white == white)) sideScore += 8;
+        if (!(ePawn.type == P && ePawn.white == white)) sideScore += 8;
+
+        // Penalize king stuck in center once castling rights are gone.
+        const int kingSq = lsbSquare64(gs.bitboards[side][K - 1]);
+        const int kc = colOfSq(kingSq);
+        const bool kingCentral = (kc >= 3 && kc <= 5);
+        if (white) {
+            if (kingCentral && gs.wkMoved && gs.wrAHMoved && gs.wrHHMoved) sideScore -= 15;
+        } else {
+            if (kingCentral && gs.bkMoved && gs.brAHMoved && gs.brHHMoved) sideScore -= 15;
+        }
+
+        return sideScore;
+    };
+
+    score += sideScore(true);
+    score -= sideScore(false);
+    return score;
+}
+
+static int lightweightKingSafetyScore(const GameState& gs, bool eg)
+{
+    if (eg) {
+        return 0;
+    }
+
+    static constexpr uint64_t fileMasks[8] = {
+        0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+        0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL
+    };
+
+    const uint64_t wPawns = gs.bitboards[0][P - 1];
+    const uint64_t bPawns = gs.bitboards[1][P - 1];
+
+    auto sidePenalty = [&](bool white) {
+        const int side = white ? 0 : 1;
+        const int kingSq = lsbSquare64(gs.bitboards[side][K - 1]);
+        const int kr = rowOfSq(kingSq);
+        const int kc = colOfSq(kingSq);
+        const uint64_t ownPawns = white ? wPawns : bPawns;
+        const uint64_t allPawns = wPawns | bPawns;
+
+        int penalty = 0;
+
+        for (int dc = -1; dc <= 1; ++dc) {
+            const int c = kc + dc;
+            if (c < 0 || c > 7) {
+                continue;
+            }
+
+            const int front1r = white ? (kr - 1) : (kr + 1);
+            const int front2r = white ? (kr - 2) : (kr + 2);
+
+            bool shield1 = false;
+            bool shield2 = false;
+
+            if (front1r >= 0 && front1r < 8) {
+                const int sq = front1r * 8 + c;
+                shield1 = (ownPawns & (1ULL << sq)) != 0;
+            }
+            if (front2r >= 0 && front2r < 8) {
+                const int sq = front2r * 8 + c;
+                shield2 = (ownPawns & (1ULL << sq)) != 0;
+            }
+
+            if (!shield1) penalty += 14;
+            if (!shield2) penalty += 8;
+
+            const bool ownOnFile = (ownPawns & fileMasks[c]) != 0;
+            const bool anyOnFile = (allPawns & fileMasks[c]) != 0;
+            if (!ownOnFile) penalty += 10;
+            if (!anyOnFile) penalty += 12;
+        }
+
+        // King exposed in center files is more vulnerable before simplification.
+        if (kc >= 3 && kc <= 4) {
+            penalty += 10;
+        }
+
+        return penalty;
+    };
+
+    const int whitePenalty = sidePenalty(true);
+    const int blackPenalty = sidePenalty(false);
+    return blackPenalty - whitePenalty;
 }
 
 static int pieceSquareTableScore(bool white, int type, int sq)
@@ -817,9 +1155,17 @@ static int evaluate(const GameState& gs)
         score += rookEndgameOffset(gs);
     }
 
-    score += pawnStructureScore(gs);
-    score += rookOpenFileBonus(gs);
+    int pawnStructure = 0;
+    int rookOpenFile = 0;
+    pawnEvalTerms(gs, pawnStructure, rookOpenFile);
+    score += pawnStructure;
+    score += rookOpenFile;
     score += bishopPairBonus(gs);
+    score += lightweightKingSafetyScore(gs, eg);
+
+    if (!eg) {
+        score += openingPrinciplesScore(gs);
+    }
 
     if (eg) {
         if (hasMatingMaterial(gs, true))  score += matingNetBonus(gs, true);
@@ -927,6 +1273,196 @@ static void generateTacticalLegalMoves(GameState& gs, MoveList& out)
     }
 }
 
+static inline uint64_t bitAtSq64(int sq)
+{
+    return 1ULL << sq;
+}
+
+static uint64_t attackersToSquare(const std::array<std::array<uint64_t, 6>, 2>& pieces,
+                                  uint64_t occupancy,
+                                  int targetSq,
+                                  int side)
+{
+    uint64_t attackers = 0;
+    const int tr = rowOfSq(targetSq);
+    const int tc = colOfSq(targetSq);
+
+    // Pawn attackers depend on side to move toward the target square.
+    if (side == 0) {
+        if (tr < 7 && tc > 0) {
+            const int sq = targetSq + 7;
+            if (pieces[0][P - 1] & bitAtSq64(sq)) attackers |= bitAtSq64(sq);
+        }
+        if (tr < 7 && tc < 7) {
+            const int sq = targetSq + 9;
+            if (pieces[0][P - 1] & bitAtSq64(sq)) attackers |= bitAtSq64(sq);
+        }
+    } else {
+        if (tr > 0 && tc > 0) {
+            const int sq = targetSq - 9;
+            if (pieces[1][P - 1] & bitAtSq64(sq)) attackers |= bitAtSq64(sq);
+        }
+        if (tr > 0 && tc < 7) {
+            const int sq = targetSq - 7;
+            if (pieces[1][P - 1] & bitAtSq64(sq)) attackers |= bitAtSq64(sq);
+        }
+    }
+
+    static constexpr int knightOffsets[8][2] = {
+        { -2, -1 }, { -2, 1 }, { -1, -2 }, { -1, 2 },
+        { 1, -2 },  { 1, 2 },  { 2, -1 },  { 2, 1 },
+    };
+    for (const auto& d : knightOffsets) {
+        const int nr = tr + d[0];
+        const int nc = tc + d[1];
+        if (nr < 0 || nr > 7 || nc < 0 || nc > 7) continue;
+        const int sq = nr * 8 + nc;
+        const uint64_t m = bitAtSq64(sq);
+        if (pieces[side][N - 1] & m) attackers |= m;
+    }
+
+    static constexpr int kingOffsets[8][2] = {
+        { -1, -1 }, { -1, 0 }, { -1, 1 },
+        { 0, -1 },              { 0, 1 },
+        { 1, -1 },  { 1, 0 },   { 1, 1 },
+    };
+    for (const auto& d : kingOffsets) {
+        const int nr = tr + d[0];
+        const int nc = tc + d[1];
+        if (nr < 0 || nr > 7 || nc < 0 || nc > 7) continue;
+        const int sq = nr * 8 + nc;
+        const uint64_t m = bitAtSq64(sq);
+        if (pieces[side][K - 1] & m) attackers |= m;
+    }
+
+    static constexpr int diag[4][2] = { { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 } };
+    for (const auto& d : diag) {
+        int nr = tr + d[0];
+        int nc = tc + d[1];
+        while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+            const int sq = nr * 8 + nc;
+            const uint64_t m = bitAtSq64(sq);
+            if (occupancy & m) {
+                if ((pieces[side][B - 1] & m) || (pieces[side][Q - 1] & m)) {
+                    attackers |= m;
+                }
+                break;
+            }
+            nr += d[0];
+            nc += d[1];
+        }
+    }
+
+    static constexpr int ortho[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+    for (const auto& d : ortho) {
+        int nr = tr + d[0];
+        int nc = tc + d[1];
+        while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+            const int sq = nr * 8 + nc;
+            const uint64_t m = bitAtSq64(sq);
+            if (occupancy & m) {
+                if ((pieces[side][R - 1] & m) || (pieces[side][Q - 1] & m)) {
+                    attackers |= m;
+                }
+                break;
+            }
+            nr += d[0];
+            nc += d[1];
+        }
+    }
+
+    return attackers;
+}
+
+static int leastValuableAttackerSquare(const std::array<std::array<uint64_t, 6>, 2>& pieces,
+                                       int side,
+                                       uint64_t attackers,
+                                       int& pieceType)
+{
+    static constexpr int order[6] = { P, N, B, R, Q, K };
+    for (int pt : order) {
+        uint64_t bb = attackers & pieces[side][pt - 1];
+        if (bb) {
+            pieceType = pt;
+            return lsbSquare64(bb);
+        }
+    }
+    pieceType = EMPTY;
+    return -1;
+}
+
+static int staticExchangeEval(const GameState& gs, const Move& m)
+{
+    if (!m.isCapture() || m.isEnPassant()) {
+        return 0;
+    }
+
+    const int fromSq = m.from();
+    const int toSq = m.to();
+    const uint64_t fromMask = bitAtSq64(fromSq);
+    const uint64_t toMask = bitAtSq64(toSq);
+
+    const int us = gs.whiteToMove ? 0 : 1;
+    const int them = us ^ 1;
+    const Piece movingPiece = pieceAtSq(gs, fromSq);
+    if (movingPiece.type == EMPTY) {
+        return 0;
+    }
+
+    int capturedType = m.capturedType();
+    if (capturedType == EMPTY) {
+        capturedType = pieceAtSq(gs, toSq).type;
+    }
+    if (capturedType == EMPTY) {
+        return 0;
+    }
+
+    std::array<std::array<uint64_t, 6>, 2> pieces = gs.bitboards;
+    uint64_t occupancy = gs.occupancyBoth;
+
+    pieces[us][movingPiece.type - 1] ^= fromMask;
+    pieces[us][m.isPromotion() ? (m.promotionType() - 1) : (movingPiece.type - 1)] |= toMask;
+    pieces[them][capturedType - 1] ^= toMask;
+    occupancy ^= fromMask;
+
+    int gain[32];
+    int depth = 0;
+    gain[0] = pieceValue(capturedType);
+
+    int side = them;
+    int capturedOnTarget = m.isPromotion() ? m.promotionType() : movingPiece.type;
+
+    while (depth < 30) {
+        const uint64_t attackers = attackersToSquare(pieces, occupancy, toSq, side);
+        int attackerType = EMPTY;
+        const int attackerSq = leastValuableAttackerSquare(pieces, side, attackers, attackerType);
+        if (attackerSq < 0) {
+            break;
+        }
+
+        const uint64_t attackerMask = bitAtSq64(attackerSq);
+        const int other = side ^ 1;
+
+        ++depth;
+        gain[depth] = pieceValue(capturedOnTarget) - gain[depth - 1];
+
+        pieces[side][attackerType - 1] ^= attackerMask;
+        occupancy ^= attackerMask;
+        pieces[other][capturedOnTarget - 1] ^= toMask;
+        pieces[side][attackerType - 1] |= toMask;
+
+        capturedOnTarget = attackerType;
+        side = other;
+    }
+
+    while (depth > 0) {
+        gain[depth - 1] = -std::max(-gain[depth - 1], gain[depth]);
+        --depth;
+    }
+
+    return gain[0];
+}
+
 static int quiescence(GameState& gs, int alpha, int beta, int ply)
 {
     ss.nodes++;
@@ -968,6 +1504,10 @@ static int quiescence(GameState& gs, int alpha, int beta, int ply)
 
     for (int i = 0; i < moves.count; ++i) {
         Move& m = moves.moves[i];
+        if (m.isCapture() && !m.isEnPassant() && staticExchangeEval(gs, m) < 0) {
+            continue;
+        }
+
         searchMakeMove(gs, m);
         int score = -quiescence(gs, -beta, -alpha, ply + 1);
         searchUndoMove(gs);
@@ -1010,13 +1550,18 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     const bool inCheck = isInCheck(gs, gs.whiteToMove);
 
+    // Check extension: improve tactical accuracy in forced lines.
+    if (inCheck && depth > 0 && depth < 8) {
+        depth += 1;
+    }
+
     if (depth == 0) return quiescence(gs, alpha, beta, ply);
 
     int staticEval = 0;
     if (!inCheck) {
         staticEval = evaluate(gs);
-        if (depth <= 2) {
-            const int rfpMargin = 120 * depth;
+        if (depth == 1) {
+            const int rfpMargin = 80;
             if (staticEval - rfpMargin >= beta) {
                 return staticEval;
             }
@@ -1049,26 +1594,46 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
     Move bestMove = moves.moves[0];
     int  bestScore = -INF;
     int  moveCount = 0;
-    const bool useFutility = !inCheck && depth <= 2;
+    const bool pvNode = (beta - alpha) > 1;
+    const bool useFutility = !inCheck && depth == 1;
     const int futilityBase = staticEval;
 
     for (int i = 0; i < moves.count; ++i) {
         Move& m = moves.moves[i];
         moveCount++;
+        const bool quietMove = !m.isCapture() && !m.isPromotion();
 
-        if (useFutility && moveCount > 1 && !m.isCapture() && !m.isPromotion()) {
-            const int futilityMargin = 100 * depth;
+        if (useFutility && moveCount > 3 && quietMove) {
+            const int futilityMargin = 120;
             if (futilityBase + futilityMargin <= alpha) {
                 continue;
             }
         }
 
+        if (!pvNode && !inCheck && quietMove && depth <= 4 && moveCount > (2 + depth * 3)) {
+            const int lmpMargin = 140 + depth * 100;
+            if (futilityBase + lmpMargin <= alpha) {
+                continue;
+            }
+        }
+
+        int quietHistory = 0;
+        if (quietMove && m.from() < 64 && m.to() < 64) {
+            const int side = gs.whiteToMove ? 0 : 1;
+            quietHistory = ss.history[side][rowOfSq(m.from())][colOfSq(m.from())][rowOfSq(m.to())][colOfSq(m.to())];
+        }
+
         searchMakeMove(gs, m);
+        const bool givesCheck = isInCheck(gs, gs.whiteToMove);
 
         int score;
-        if (moveCount > 4 && depth >= 3 && !m.isCapture() && !m.isPromotion() && !isInCheck(gs, gs.whiteToMove)) {
-            int reduction = 1 + (moveCount > 12 ? 1 : 0);
-            score = -negamax(gs, depth - 1 - reduction, -alpha-1, -alpha, ply+1, true);
+        if (!pvNode && quietMove && depth >= 3 && moveCount > 3 && !givesCheck) {
+            int reduction = 1;
+            if (moveCount > 8) reduction++;
+            if (depth >= 6 && moveCount > 14) reduction++;
+            if (quietHistory > 8000 && reduction > 1) reduction--;
+
+            score = -negamax(gs, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, true);
             if (score > alpha)
                 score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
         }
@@ -1112,6 +1677,14 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
 Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 {
+    if (timeLimitMs >= 10000) {
+        Move bookMove = bookMoveForPosition(gs);
+        if (isValidMove(bookMove)) {
+            lastSearchStats = SearchStats {};
+            return bookMove;
+        }
+    }
+
     MoveList moves;
     generateLegalMoves(gs, moves);
     if (moves.empty()) {
@@ -1127,7 +1700,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
     ss.evalPly = 0;
     ss.evalCoreNoKingStack[0] = computeCoreEvalNoKing(gs);
 
-    if (isEndgame(gs)) maxDepth += 6;
+    maxDepth += phaseDepthBonus(gs);
     if (isKQKFamily(gs, true) || isKQKFamily(gs, false)) maxDepth += 2;
 
     const int rootEval = evaluate(gs);
@@ -1142,7 +1715,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
         int  currentBestScore = -INF;
         uint64_t hash = computeHash(gs);
         TTEntry* e = tt.probe(hash);
-        Move ttMove = (e && e->bestMove.from() < 64)
+        Move ttMove = (e && isValidMove(e->bestMove))
             ? e->bestMove
             : invalidMove();
         sortMoves(moves, gs, 0, ttMove);
@@ -1152,9 +1725,9 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
             searchMakeMove(gs, m);
 
             bool createsImmediateThreefold = false;
-            const std::string childPos = boardToString(gs);
-            auto posIt = gs.positionCounts.find(childPos);
-            if (posIt != gs.positionCounts.end() && posIt->second >= 2) {
+            const std::uint64_t childHash = positionHash(gs);
+            auto posIt = gs.positionHashCounts.find(childHash);
+            if (posIt != gs.positionHashCounts.end() && posIt->second >= 2) {
                 createsImmediateThreefold = true;
             }
 

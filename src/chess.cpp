@@ -288,7 +288,8 @@ Piece pieceAtSq(const GameState& gs, int sq)
 void GameState::loadFromFen(const std::string& fen)
 {
     undoTop = 0;
-    positionCounts.clear();
+    positionHashCounts.clear();
+    positionHashCounts.reserve(512);
     initialFen = fen;
     clearBitboards(*this);
 
@@ -349,7 +350,7 @@ void GameState::loadFromFen(const std::string& fen)
     halfmoveClock = (parts.size() > 4) ? std::stoi(parts[4]) : 0;
     fullmoveNumber = (parts.size() > 5) ? std::stoi(parts[5]) : 1;
 
-    positionCounts[boardToString(*this)]++;
+    positionHashCounts[positionHash(*this)]++;
 }
 
 void GameState::initStandard()
@@ -627,7 +628,7 @@ void makeMove(GameState& gs, const Move& m, bool trackHistory)
         gs.undoStack[gs.undoTop++] = undo;
     }
     if (trackHistory) {
-        gs.positionCounts[boardToString(gs)]++;
+        gs.positionHashCounts[positionHash(gs)]++;
     }
 }
 
@@ -637,12 +638,12 @@ void undoMove(GameState& gs, bool trackHistory)
         return;
 
     if (trackHistory) {
-        const std::string currentPos = boardToString(gs);
-        auto it = gs.positionCounts.find(currentPos);
-        if (it != gs.positionCounts.end()) {
+        const uint64_t key = positionHash(gs);
+        auto it = gs.positionHashCounts.find(key);
+        if (it != gs.positionHashCounts.end()) {
             it->second--;
             if (it->second <= 0) {
-                gs.positionCounts.erase(it);
+                gs.positionHashCounts.erase(it);
             }
         }
     }
@@ -812,6 +813,36 @@ std::string boardToString(const GameState& gs)
     return ss.str();
 }
 
+std::uint64_t positionHash(const GameState& gs)
+{
+    // FNV-1a over piece placement plus repetition-relevant state.
+    std::uint64_t h = 1469598103934665603ULL;
+    for (int sq = 0; sq < 64; ++sq) {
+        h ^= static_cast<std::uint64_t>(gs.pieceOnSquare[sq]);
+        h *= 1099511628211ULL;
+    }
+
+    h ^= static_cast<std::uint64_t>(gs.whiteToMove ? 1u : 2u);
+    h *= 1099511628211ULL;
+
+    std::uint64_t castlingBits = 0;
+    castlingBits |= (!gs.wkMoved && !gs.wrHHMoved) ? 1ULL : 0ULL;
+    castlingBits |= (!gs.wkMoved && !gs.wrAHMoved) ? 2ULL : 0ULL;
+    castlingBits |= (!gs.bkMoved && !gs.brHHMoved) ? 4ULL : 0ULL;
+    castlingBits |= (!gs.bkMoved && !gs.brAHMoved) ? 8ULL : 0ULL;
+    h ^= castlingBits;
+    h *= 1099511628211ULL;
+
+    if (gs.enPassantTarget.has_value()) {
+        h ^= static_cast<std::uint64_t>(16 + gs.enPassantTarget->first * 8 + gs.enPassantTarget->second);
+    } else {
+        h ^= 0xFFULL;
+    }
+    h *= 1099511628211ULL;
+
+    return h;
+}
+
 std::optional<std::string> checkGameOver(GameState& gs)
 {
     auto legalMoves = generateLegalMoves(gs);
@@ -826,8 +857,9 @@ std::optional<std::string> checkGameOver(GameState& gs)
     if (!hasSufficientMaterial(gs))
         return std::string("Draw by insufficient material.");
 
-    std::string currentPos = boardToString(gs);
-    if (gs.positionCounts[currentPos] >= 3)
+    std::uint64_t key = positionHash(gs);
+    auto it = gs.positionHashCounts.find(key);
+    if (it != gs.positionHashCounts.end() && it->second >= 3)
         return std::string("Draw by threefold repetition.");
 
     return std::nullopt;

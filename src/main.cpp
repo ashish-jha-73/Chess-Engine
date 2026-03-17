@@ -34,6 +34,19 @@ void clearSelection(optional<pair<int, int>>& selectedSquare, vector<Move>& lega
     isDragging = false;
 }
 
+bool sameMoveIdentity(const Move& a, const Move& b)
+{
+    if (a.from() != b.from() || a.to() != b.to()) return false;
+    if (a.isPromotion() != b.isPromotion()) return false;
+    if (a.isPromotion() && a.promotionType() != b.promotionType()) return false;
+    return true;
+}
+
+bool sameMoveFromTo(const Move& a, const Move& b)
+{
+    return a.from() == b.from() && a.to() == b.to();
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && std::string(argv[1]) == "--bench") {
@@ -229,8 +242,35 @@ int main(int argc, char** argv)
 
             if (completedMove.has_value()) {
                 if (aiEnabled && gs.whiteToMove == aiPlaysWhite) {
-                    makeMove(gs, *completedMove);
-                    gameOverMsg = checkGameOver(gs);
+                    bool legalNow = false;
+                    MoveList legal;
+                    generateLegalMoves(gs, legal);
+
+                    for (int i = 0; i < legal.count; ++i) {
+                        if (sameMoveIdentity(legal.moves[i], *completedMove)) {
+                            *completedMove = legal.moves[i];
+                            legalNow = true;
+                            break;
+                        }
+                    }
+
+                    if (!legalNow) {
+                        for (int i = 0; i < legal.count; ++i) {
+                            if (sameMoveFromTo(legal.moves[i], *completedMove)) {
+                                *completedMove = legal.moves[i];
+                                legalNow = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (legalNow) {
+                        makeMove(gs, *completedMove);
+                        gameOverMsg = checkGameOver(gs);
+                    } else {
+                        // If a stale/invalid result appears, request a fresh search.
+                        maybeDoAIMove();
+                    }
                 }
             }
         }
