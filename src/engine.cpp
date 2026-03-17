@@ -15,6 +15,10 @@ static constexpr int INF         =  1000000000;
 static constexpr int MATE_SCORE  =  1000000;
 static constexpr int DRAW_SCORE  =  0;
 static constexpr int MAX_DEPTH   = 100;
+static constexpr int INVALID_SQ  = 255;
+
+inline int rowOfSq(int sq) { return sq / 8; }
+inline int colOfSq(int sq) { return sq % 8; }
 
 static constexpr int MAX_PLY     = 64;   
 static constexpr int MAX_KILLERS = 2; 
@@ -131,21 +135,32 @@ struct Zobrist {
     }
 } static const zob;
 
-static int pieceIndex(int type) {
-    switch(type){ case P:return 0; case N:return 1; case B:return 2;
-                  case R:return 3; case Q:return 4; case K:return 5; }
-    return 0;
-}
-
 uint64_t computeHash(const GameState& gs)
 {
     uint64_t h = 0;
-    for (int r = 0; r < 8; r++)
-        for (int c = 0; c < 8; c++) {
-            auto p = gs.board[r][c];
-            if (p.type == EMPTY) continue;
-            h ^= zob.pieces[pieceIndex(p.type)][p.white ? 0 : 1][r][c];
+    for (int color = 0; color < 2; ++color) {
+        for (int pt = 0; pt < 6; ++pt) {
+            uint64_t bb = gs.bitboards[color][pt];
+            while (bb) {
+                const uint64_t lsb = bb & -bb;
+                const int sq = __builtin_ctzll(bb);
+                bb ^= lsb;
+                const int r = sq / 8;
+                const int c = sq % 8;
+                h ^= zob.pieces[pt][color][r][c];
+            }
         }
+    }
+
+    if (!gs.wkMoved && !gs.wrHHMoved) h ^= zob.castling[0];
+    if (!gs.wkMoved && !gs.wrAHMoved) h ^= zob.castling[1];
+    if (!gs.bkMoved && !gs.brHHMoved) h ^= zob.castling[2];
+    if (!gs.bkMoved && !gs.brAHMoved) h ^= zob.castling[3];
+
+    if (gs.enPassantTarget.has_value()) {
+        h ^= zob.enPassant[gs.enPassantTarget->second];
+    }
+
     if (!gs.whiteToMove) h ^= zob.sideToMove;
     return h;
 }
@@ -158,7 +173,7 @@ struct TTEntry {
     int      score   = 0;
     int      depth   = -1;
     TTFlag   flag    = TT_EXACT;
-    Move     bestMove{ -1,-1,-1,-1 };
+    Move     bestMove{ static_cast<std::uint8_t>(INVALID_SQ), static_cast<std::uint8_t>(INVALID_SQ), 0, static_cast<std::uint8_t>(Q), static_cast<std::uint8_t>(EMPTY) };
 };
 
 static constexpr size_t TT_SIZE = 1 << 22;
@@ -196,7 +211,7 @@ struct SearchState {
         stopped = false;
         for (auto& ply : killers)
             for (auto& k : ply)
-                k = { -1,-1,-1,-1 };
+                k = { static_cast<std::uint8_t>(INVALID_SQ), static_cast<std::uint8_t>(INVALID_SQ), 0, static_cast<std::uint8_t>(Q), static_cast<std::uint8_t>(EMPTY) };
         for (auto& a : history)
             for (auto& b : a)
                 for (auto& c : b)
@@ -416,29 +431,30 @@ static int evaluate(const GameState& gs)
 
 static int scoreMoveForOrdering(const GameState& gs, const Move& m, int ply, const Move& ttMove)
 {
-    if (m.sx == ttMove.sx && m.sy == ttMove.sy &&
-        m.dx == ttMove.dx && m.dy == ttMove.dy)
+    if (m.from == ttMove.from && m.to == ttMove.to &&
+        m.flags == ttMove.flags && m.promotionType == ttMove.promotionType)
         return 2000000;
 
-    if (m.captured.has_value()) {
-        int victim   = pieceValue(m.captured->type);
-        int attacker = pieceValue(gs.board[m.sx][m.sy].type);
+    if (m.isCapture()) {
+        const int fromR = rowOfSq(m.from);
+        const int fromC = colOfSq(m.from);
+        int victim   = pieceValue(m.capturedType);
+        int attacker = pieceValue(gs.board[fromR][fromC].type);
         return 1'000'000 + (victim * 10) - attacker;
     }
 
-    if (m.promotion) return 900000;
+    if (m.isPromotion()) return 900000;
 
     for (int i = 0; i < MAX_KILLERS; i++)
         if (ply < MAX_PLY &&
-            m.sx == ss.killers[ply][i].sx && m.sy == ss.killers[ply][i].sy &&
-            m.dx == ss.killers[ply][i].dx && m.dy == ss.killers[ply][i].dy)
+            m.from == ss.killers[ply][i].from && m.to == ss.killers[ply][i].to &&
+            m.flags == ss.killers[ply][i].flags && m.promotionType == ss.killers[ply][i].promotionType)
             return 800000 - i * 100;
 
     int side = gs.whiteToMove ? 0 : 1;
     int h = 0;
-    if (m.sx>=0 && m.sx<8 && m.sy>=0 && m.sy<8 &&
-        m.dx>=0 && m.dx<8 && m.dy>=0 && m.dy<8)
-        h = ss.history[side][m.sx][m.sy][m.dx][m.dy];
+    if (m.from < 64 && m.to < 64)
+        h = ss.history[side][rowOfSq(m.from)][colOfSq(m.from)][rowOfSq(m.to)][colOfSq(m.to)];
 
     return h;
 }
@@ -456,19 +472,17 @@ static void sortMoves(std::vector<Move>& moves, const GameState& gs, int ply,
 static void storeKiller(int ply, const Move& m)
 {
     if (ply >= MAX_PLY) return;
-    if (m.captured.has_value()) return;
+    if (m.isCapture()) return;
     ss.killers[ply][1] = ss.killers[ply][0];
     ss.killers[ply][0] = m;
 }
 
 static void updateHistory(const GameState& gs, const Move& m, int depth)
 {
-    if (!m.captured.has_value() &&
-        m.sx>=0 && m.sx<8 && m.sy>=0 && m.sy<8 &&
-        m.dx>=0 && m.dx<8 && m.dy>=0 && m.dy<8)
+    if (!m.isCapture() && m.from < 64 && m.to < 64)
     {
         int side = gs.whiteToMove ? 0 : 1;
-        ss.history[side][m.sx][m.sy][m.dx][m.dy] += depth * depth;
+        ss.history[side][rowOfSq(m.from)][colOfSq(m.from)][rowOfSq(m.to)][colOfSq(m.to)] += depth * depth;
     }
 }
 
@@ -483,16 +497,16 @@ static int quiescence(GameState& gs, int alpha, int beta)
 
     auto moves = generateLegalMoves(gs);
 
-    Move dummy{-1,-1,-1,-1};
+    Move dummy{ static_cast<std::uint8_t>(INVALID_SQ), static_cast<std::uint8_t>(INVALID_SQ), 0, static_cast<std::uint8_t>(Q), static_cast<std::uint8_t>(EMPTY) };
     sortMoves(moves, gs, 0, dummy);
 
     for (auto& m : moves) {
-        if (!m.captured.has_value() && !m.promotion)
+        if (!m.isCapture() && !m.isPromotion())
             continue;
 
-        makeMove(gs, m);
+        makeMove(gs, m, false);
         int score = -quiescence(gs, -beta, -alpha);
-        undoMove(gs);
+        undoMove(gs, false);
 
         if (score >= beta) return beta;
         if (score > alpha)  alpha = score;
@@ -509,7 +523,7 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     uint64_t hash = computeHash(gs);
     TTEntry* entry = tt.probe(hash);
-    Move ttBestMove{-1,-1,-1,-1};
+    Move ttBestMove{ static_cast<std::uint8_t>(INVALID_SQ), static_cast<std::uint8_t>(INVALID_SQ), 0, static_cast<std::uint8_t>(Q), static_cast<std::uint8_t>(EMPTY) };
 
     if (entry && entry->depth >= depth && ply > 0) {
         int ttScore = entry->score;
@@ -551,10 +565,10 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     for (auto& m : moves) {
         moveCount++;
-        makeMove(gs, m);
+        makeMove(gs, m, false);
 
         int score;
-        if (moveCount > 4 && depth >= 3 && !m.captured.has_value() && !m.promotion && !isInCheck(gs, gs.whiteToMove)) {
+        if (moveCount > 4 && depth >= 3 && !m.isCapture() && !m.isPromotion() && !isInCheck(gs, gs.whiteToMove)) {
             int reduction = 1 + (moveCount > 12 ? 1 : 0);
             score = -negamax(gs, depth - 1 - reduction, -alpha-1, -alpha, ply+1, true);
             if (score > alpha)
@@ -570,7 +584,7 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             }
         }
 
-        undoMove(gs);
+        undoMove(gs, false);
 
         if (ss.stopped) return 0;
 
@@ -583,7 +597,7 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             alpha = score;
             flag  = TT_EXACT;
 
-            if (!m.captured.has_value())
+            if (!m.isCapture())
                 updateHistory(gs, m, depth);
         }
 
@@ -601,7 +615,9 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 {
     auto moves = generateLegalMoves(gs);
-    if (moves.empty()) return Move{ -1,-1,-1,-1 };
+    if (moves.empty()) {
+        return Move{ static_cast<std::uint8_t>(INVALID_SQ), static_cast<std::uint8_t>(INVALID_SQ), 0, static_cast<std::uint8_t>(Q), static_cast<std::uint8_t>(EMPTY) };
+    }
 
     ss.clear();
     ss.startTime   = std::chrono::steady_clock::now();
@@ -619,13 +635,15 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 
         uint64_t hash = computeHash(gs);
         TTEntry* e = tt.probe(hash);
-        Move ttMove = (e && e->bestMove.sx != -1) ? e->bestMove : Move{-1,-1,-1,-1};
+        Move ttMove = (e && e->bestMove.from < 64)
+            ? e->bestMove
+            : Move{ static_cast<std::uint8_t>(INVALID_SQ), static_cast<std::uint8_t>(INVALID_SQ), 0, static_cast<std::uint8_t>(Q), static_cast<std::uint8_t>(EMPTY) };
         sortMoves(moves, gs, 0, ttMove);
 
         for (auto& m : moves) {
-            makeMove(gs, m);
+            makeMove(gs, m, false);
             int score = -negamax(gs, depth - 1, -beta, -alpha, 1, true);
-            undoMove(gs);
+            undoMove(gs, false);
 
             if (ss.stopped) goto done;
 

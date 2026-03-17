@@ -1,5 +1,5 @@
 CXX := g++
-CXXFLAGS := -O2 -Wall -Wextra -std=c++23 -Iinclude
+CXXFLAGS := -O3 -Wall -Wextra -std=c++23 -Iinclude
 LDFLAGS := -lsfml-graphics -lsfml-window -lsfml-system
 
 SRC_DIR := src

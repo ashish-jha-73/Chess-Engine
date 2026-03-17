@@ -136,7 +136,7 @@ int main()
         clearSelection(selectedSquare, legalMovesForSelected, isDragging);
         choosingPromotion = false;
     });
-    addButton("Save", 60, [&]() { /* ... */ });
+    addButton("Save", 60, [&]() {  });
     addButton("Play vs AI: OFF", 140, [&]() {
         if (isAIThinking) return;
         auto& aiButtonLabel = buttons[3].label;
@@ -226,13 +226,13 @@ int main()
                             } else if (selectedSquare.has_value()) {
                                 optional<Move> theMove;
                                 for (const auto& legalMove : legalMovesForSelected) {
-                                    if (legalMove.dx == r && legalMove.dy == c) {
+                                    if (legalMove.to == r * 8 + c) {
                                         theMove = legalMove;
                                         break;
                                     }
                                 }
                                 if (theMove.has_value()) {
-                                    if (theMove->promotion) {
+                                    if (theMove->isPromotion()) {
                                         choosingPromotion = true;
                                         pendingPromotionMove = theMove;
                                         clearSelection(selectedSquare, legalMovesForSelected, isDragging);
@@ -254,7 +254,7 @@ int main()
                                 selectedSquare = make_pair(r, c);
                                 auto allLegalMoves = generateLegalMoves(gs);
                                 for (const auto& m : allLegalMoves) {
-                                    if (m.sx == r && m.sy == c)
+                                    if (m.from == r * 8 + c)
                                         legalMovesForSelected.push_back(m);
                                 }
                                 dragStartPos = mp;
@@ -292,13 +292,13 @@ int main()
                         if (inBounds(r, c)) {
                             optional<Move> theMove;
                             for (const auto& legalMove : legalMovesForSelected) {
-                                if (legalMove.dx == r && legalMove.dy == c) {
+                                if (legalMove.to == r * 8 + c) {
                                     theMove = legalMove;
                                     break;
                                 }
                             }
                             if (theMove.has_value()) {
-                                if (theMove->promotion) {
+                                if (theMove->isPromotion()) {
                                     choosingPromotion = true;
                                     pendingPromotionMove = theMove;
                                 } else {
@@ -338,9 +338,9 @@ int main()
         moveHint.setFillColor(sf::Color(130, 151, 105, 150));
         for (const auto& move : legalMovesForSelected) {
             bool isDuplicatePromotion = false;
-            if (move.promotion) {
+            if (move.isPromotion()) {
                 for (const auto& m2 : legalMovesForSelected) {
-                    if (&move != &m2 && move.dx == m2.dx && move.dy == m2.dy) {
+                    if (&move != &m2 && move.to == m2.to) {
                         if (move.promotionType > m2.promotionType) {
                             isDuplicatePromotion = true;
                             break;
@@ -349,7 +349,9 @@ int main()
                 }
             }
             if (!isDuplicatePromotion) {
-                moveHint.setPosition({(float)move.dy * 80.f + 40.f - 15.f, (float)boardYOffset + move.dx * 80.f + 40.f - 15.f});
+                const int moveRow = move.to / 8;
+                const int moveCol = move.to % 8;
+                moveHint.setPosition({(float)moveCol * 80.f + 40.f - 15.f, (float)boardYOffset + moveRow * 80.f + 40.f - 15.f});
                 window.draw(moveHint);
             }
         }
