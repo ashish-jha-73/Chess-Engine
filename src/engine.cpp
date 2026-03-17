@@ -518,15 +518,16 @@ static int phaseDepthBonus(const GameState& gs)
 {
     // Use non-pawn material as a cheap phase proxy.
     int npm = 0;
+    npm += pieceValue(P) * (popcount64(gs.bitboards[0][P - 1]) + popcount64(gs.bitboards[1][P - 1]));
     npm += pieceValue(N) * (popcount64(gs.bitboards[0][N - 1]) + popcount64(gs.bitboards[1][N - 1]));
     npm += pieceValue(B) * (popcount64(gs.bitboards[0][B - 1]) + popcount64(gs.bitboards[1][B - 1]));
     npm += pieceValue(R) * (popcount64(gs.bitboards[0][R - 1]) + popcount64(gs.bitboards[1][R - 1]));
     npm += pieceValue(Q) * (popcount64(gs.bitboards[0][Q - 1]) + popcount64(gs.bitboards[1][Q - 1]));
 
     // Opening -> middlegame -> middle-endgame -> endgame.
-    if (npm >= 5200) return 0;
-    if (npm >= 3600) return 1;
-    if (npm >= 2200) return 2;
+    if (npm >= 5000) return 0;
+    if (npm >= 3000) return 1;
+    if (npm >= 2000) return 2;
     return 3;
 }
 
@@ -826,6 +827,16 @@ static int pieceSquareTableScore(bool white, int type, int sq)
     }
 }
 
+static int gamePhase24(const GameState& gs)
+{
+    int phase = 0;
+    phase += popcount64(gs.bitboards[0][N - 1]) + popcount64(gs.bitboards[1][N - 1]);
+    phase += popcount64(gs.bitboards[0][B - 1]) + popcount64(gs.bitboards[1][B - 1]);
+    phase += 2 * (popcount64(gs.bitboards[0][R - 1]) + popcount64(gs.bitboards[1][R - 1]));
+    phase += 4 * (popcount64(gs.bitboards[0][Q - 1]) + popcount64(gs.bitboards[1][Q - 1]));
+    return std::clamp(phase, 0, 24);
+}
+
 static int pieceContributionNoKing(bool white, int type, int sq)
 {
     if (type == EMPTY || type == K) {
@@ -848,7 +859,7 @@ static int computeCoreEvalNoKing(const GameState& gs)
     return score;
 }
 
-static int kingPstScore(const GameState& gs, bool eg)
+static int kingPstMiddleScore(const GameState& gs)
 {
     const int wKingSq = lsbSquare64(gs.bitboards[0][K - 1]);
     const int bKingSq = lsbSquare64(gs.bitboards[1][K - 1]);
@@ -858,9 +869,117 @@ static int kingPstScore(const GameState& gs, bool eg)
     const int wRow = wr;
     const int bRow = 7 - br;
 
-    const int wPst = eg ? kingEndTable[wRow][wc] : kingMiddleTable[wRow][wc];
-    const int bPst = eg ? kingEndTable[bRow][bc] : kingMiddleTable[bRow][bc];
+    const int wPst = kingMiddleTable[wRow][wc];
+    const int bPst = kingMiddleTable[bRow][bc];
     return wPst - bPst;
+}
+
+static int kingPstEndScore(const GameState& gs)
+{
+    const int wKingSq = lsbSquare64(gs.bitboards[0][K - 1]);
+    const int bKingSq = lsbSquare64(gs.bitboards[1][K - 1]);
+
+    const int wr = rowOfSq(wKingSq), wc = colOfSq(wKingSq);
+    const int br = rowOfSq(bKingSq), bc = colOfSq(bKingSq);
+    const int wRow = wr;
+    const int bRow = 7 - br;
+
+    const int wPst = kingEndTable[wRow][wc];
+    const int bPst = kingEndTable[bRow][bc];
+    return wPst - bPst;
+}
+
+static int mobilityScore(const GameState& gs)
+{
+    static constexpr int knightW = 4;
+    static constexpr int bishopW = 5;
+    static constexpr int rookW = 2;
+
+    auto knightAttacks = [](int sq) {
+        int attacks = 0;
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        static constexpr int d[8][2] = {
+            { -2, -1 }, { -2, 1 }, { -1, -2 }, { -1, 2 },
+            { 1, -2 },  { 1, 2 },  { 2, -1 },  { 2, 1 },
+        };
+        for (const auto& o : d) {
+            const int nr = r + o[0];
+            const int nc = c + o[1];
+            if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+                attacks++;
+            }
+        }
+        return attacks;
+    };
+
+    auto sliderMobility = [&](int sq, int side, const int dirs[][2], int dirCount) {
+        int count = 0;
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        const uint64_t ownOcc = gs.occupancies[side];
+        const uint64_t occ = gs.occupancyBoth;
+
+        for (int i = 0; i < dirCount; ++i) {
+            int nr = r + dirs[i][0];
+            int nc = c + dirs[i][1];
+            while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+                const int toSq = nr * 8 + nc;
+                const uint64_t m = 1ULL << toSq;
+                if (ownOcc & m) {
+                    break;
+                }
+                count++;
+                if (occ & m) {
+                    break;
+                }
+                nr += dirs[i][0];
+                nc += dirs[i][1];
+            }
+        }
+        return count;
+    };
+
+    static constexpr int bishopDirs[4][2] = { { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 } };
+    static constexpr int rookDirs[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+
+    int whiteMob = 0;
+    int blackMob = 0;
+
+    uint64_t wn = gs.bitboards[0][N - 1];
+    while (wn) {
+        const int sq = lsbSquare64(popLsb64(wn));
+        whiteMob += knightAttacks(sq) * knightW;
+    }
+    uint64_t bn = gs.bitboards[1][N - 1];
+    while (bn) {
+        const int sq = lsbSquare64(popLsb64(bn));
+        blackMob += knightAttacks(sq) * knightW;
+    }
+
+    uint64_t wb = gs.bitboards[0][B - 1];
+    while (wb) {
+        const int sq = lsbSquare64(popLsb64(wb));
+        whiteMob += sliderMobility(sq, 0, bishopDirs, 4) * bishopW;
+    }
+    uint64_t bb = gs.bitboards[1][B - 1];
+    while (bb) {
+        const int sq = lsbSquare64(popLsb64(bb));
+        blackMob += sliderMobility(sq, 1, bishopDirs, 4) * bishopW;
+    }
+
+    uint64_t wr = gs.bitboards[0][R - 1];
+    while (wr) {
+        const int sq = lsbSquare64(popLsb64(wr));
+        whiteMob += sliderMobility(sq, 0, rookDirs, 4) * rookW;
+    }
+    uint64_t br = gs.bitboards[1][R - 1];
+    while (br) {
+        const int sq = lsbSquare64(popLsb64(br));
+        blackMob += sliderMobility(sq, 1, rookDirs, 4) * rookW;
+    }
+
+    return whiteMob - blackMob;
 }
 
 static int rookEndgameOffset(const GameState& gs)
@@ -1147,48 +1266,64 @@ static int kqkFamilyBonus(const GameState& gs, bool whiteHasQueen)
 
 static int evaluate(const GameState& gs)
 {
-    int score = ss.evalActive ? ss.evalCoreNoKingStack[ss.evalPly] : computeCoreEvalNoKing(gs);
+    int baseScore = ss.evalActive ? ss.evalCoreNoKingStack[ss.evalPly] : computeCoreEvalNoKing(gs);
     bool eg = isEndgame(gs);
+    const int phase = gamePhase24(gs);
 
-    score += kingPstScore(gs, eg);
-    if (eg) {
-        score += rookEndgameOffset(gs);
-    }
+    int mgScore = baseScore;
+    int egScore = baseScore;
+
+    mgScore += kingPstMiddleScore(gs);
+    egScore += kingPstEndScore(gs);
 
     int pawnStructure = 0;
     int rookOpenFile = 0;
     pawnEvalTerms(gs, pawnStructure, rookOpenFile);
-    score += pawnStructure;
-    score += rookOpenFile;
-    score += bishopPairBonus(gs);
-    score += lightweightKingSafetyScore(gs, eg);
+    mgScore += pawnStructure;
+    egScore += pawnStructure;
+    mgScore += rookOpenFile;
+    egScore += rookOpenFile;
+
+    const int bishopPair = bishopPairBonus(gs);
+    mgScore += bishopPair;
+    egScore += bishopPair;
+
+    const int mob = mobilityScore(gs);
+    mgScore += mob;
+    egScore += mob / 2;
+
+    mgScore += lightweightKingSafetyScore(gs, false);
 
     if (!eg) {
-        score += openingPrinciplesScore(gs);
+        mgScore += openingPrinciplesScore(gs);
     }
+
+    egScore += rookEndgameOffset(gs);
 
     if (eg) {
-        if (hasMatingMaterial(gs, true))  score += matingNetBonus(gs, true);
-        if (hasMatingMaterial(gs, false)) score -= matingNetBonus(gs, false);
+        if (hasMatingMaterial(gs, true))  egScore += matingNetBonus(gs, true);
+        if (hasMatingMaterial(gs, false)) egScore -= matingNetBonus(gs, false);
 
         if (isKRK(gs, true)) {
-            score += krkBonus(gs, true);
+            egScore += krkBonus(gs, true);
         } else if (isKRK(gs, false)) {
-            score += krkBonus(gs, false);
+            egScore += krkBonus(gs, false);
         } else if (isKBBK(gs, true)) {
-            score += kbbkBonus(gs, true);
+            egScore += kbbkBonus(gs, true);
         } else if (isKBBK(gs, false)) {
-            score += kbbkBonus(gs, false);
+            egScore += kbbkBonus(gs, false);
         } else if (isKBNK(gs, true)) {
-            score += kbnkBonus(gs, true);
+            egScore += kbnkBonus(gs, true);
         } else if (isKBNK(gs, false)) {
-            score += kbnkBonus(gs, false);
+            egScore += kbnkBonus(gs, false);
         } else if (isKQKFamily(gs, true)) {
-            score += kqkFamilyBonus(gs, true);
+            egScore += kqkFamilyBonus(gs, true);
         } else if (isKQKFamily(gs, false)) {
-            score += kqkFamilyBonus(gs, false);
+            egScore += kqkFamilyBonus(gs, false);
         }
     }
+
+    int score = (mgScore * phase + egScore * (24 - phase)) / 24;
 
     return gs.whiteToMove ? score : -score;
 }
@@ -1537,7 +1672,6 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     TTEntry* entry = tt.probe(hash);
     Move ttBestMove = invalidMove();
-
     if (entry && entry->depth >= depth && ply > 0) {
         int ttScore = scoreFromTT(entry->score, ply);
         if (entry->flag == TT_EXACT)              return ttScore;
@@ -1627,7 +1761,9 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
         const bool givesCheck = isInCheck(gs, gs.whiteToMove);
 
         int score;
-        if (!pvNode && quietMove && depth >= 3 && moveCount > 3 && !givesCheck) {
+        if (moveCount == 1) {
+            score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
+        } else if (!pvNode && quietMove && depth >= 3 && moveCount > 3 && !givesCheck) {
             int reduction = 1;
             if (moveCount > 8) reduction++;
             if (depth >= 6 && moveCount > 14) reduction++;
@@ -1636,15 +1772,10 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             score = -negamax(gs, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, true);
             if (score > alpha)
                 score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
-        }
-        else {
-            if (moveCount == 1) {
+        } else {
+            score = -negamax(gs, depth - 1, -alpha - 1, -alpha, ply + 1, true);
+            if (score > alpha)
                 score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
-            } else {
-                score = -negamax(gs, depth - 1, -alpha - 1, -alpha, ply + 1, true);
-                if (score > alpha && score < beta)
-                    score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
-            }
         }
 
         searchUndoMove(gs);
@@ -1706,17 +1837,20 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
     Move bestMove = moves.moves[0];
     int  bestScore = -INF;
     int  depthReached = 0;
+    int  prevIterScore = 0;
+    bool hasPrevIterScore = false;
+    auto searchRootWindow = [&](int depth, int alpha, int beta, Move& outBestMove) -> int {
+        int localBestScore = -INF;
+        Move localBestMove = moves.moves[0];
 
-    for (int depth = 1; depth <= maxDepth; depth++) {
-        int alpha = -INF, beta = INF;
-        Move currentBest = moves.moves[0];
-        int  currentBestScore = -INF;
         uint64_t hash = computeHash(gs);
         TTEntry* e = tt.probe(hash);
         Move ttMove = (e && isValidMove(e->bestMove))
             ? e->bestMove
             : invalidMove();
         sortMoves(moves, gs, 0, ttMove);
+
+        int localAlpha = alpha;
 
         for (int i = 0; i < moves.count; ++i) {
             Move& m = moves.moves[i];
@@ -1729,7 +1863,15 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
                 createsImmediateThreefold = true;
             }
 
-            int score = -negamax(gs, depth - 1, -beta, -alpha, 1, true);
+            int score;
+            if (i == 0) {
+                score = -negamax(gs, depth - 1, -beta, -localAlpha, 1, true);
+            } else {
+                score = -negamax(gs, depth - 1, -localAlpha - 1, -localAlpha, 1, true);
+                if (score > localAlpha) {
+                    score = -negamax(gs, depth - 1, -beta, -localAlpha, 1, true);
+                }
+            }
 
             if (createsImmediateThreefold) {
                 if (rootEval > 150) {
@@ -1745,20 +1887,68 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 
             searchUndoMove(gs);
 
-            if (ss.stopped) goto done;
-
-            if (score > currentBestScore) {
-                currentBestScore = score;
-                currentBest = m;
+            if (ss.stopped) {
+                outBestMove = localBestMove;
+                return localBestScore;
             }
-            if (score > alpha) {
-                alpha = score;
+
+            if (score > localBestScore) {
+                localBestScore = score;
+                localBestMove = m;
+            }
+            if (score > localAlpha) {
+                localAlpha = score;
+            }
+            if (localAlpha >= beta) {
+                break;
+            }
+        }
+
+        outBestMove = localBestMove;
+        return localBestScore;
+    };
+
+    for (int depth = 1; depth <= maxDepth; depth++) {
+        Move currentBest = moves.moves[0];
+        int currentBestScore = -INF;
+
+        int alpha = -INF;
+        int beta = INF;
+        if (hasPrevIterScore && depth >= 3) {
+            const int delta = 22 + depth * 6;
+            alpha = std::max(-INF, prevIterScore - delta);
+            beta = std::min(INF, prevIterScore + delta);
+        }
+
+        currentBestScore = searchRootWindow(depth, alpha, beta, currentBest);
+        if (ss.stopped) goto done;
+
+        if (hasPrevIterScore && depth >= 3 && (currentBestScore <= alpha || currentBestScore >= beta)) {
+            int widen = 64;
+            for (int tries = 0; tries < 4; ++tries) {
+                if (currentBestScore <= alpha) {
+                    alpha = std::max(-INF, alpha - widen);
+                }
+                if (currentBestScore >= beta) {
+                    beta = std::min(INF, beta + widen);
+                }
+
+                currentBestScore = searchRootWindow(depth, alpha, beta, currentBest);
+                if (ss.stopped) goto done;
+
+                if (currentBestScore > alpha && currentBestScore < beta) {
+                    break;
+                }
+
+                widen *= 2;
             }
         }
 
         bestMove  = currentBest;
         bestScore = currentBestScore;
         depthReached = depth;
+        prevIterScore = bestScore;
+        hasPrevIterScore = true;
 
         std::cout << "depth " << depth << "  score " << bestScore << "  nodes " << ss.nodes << "\n";
     }
