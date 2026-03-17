@@ -14,6 +14,7 @@
 static constexpr int INF         =  1000000000;
 static constexpr int MATE_SCORE  =  1000000;
 static constexpr int DRAW_SCORE  =  0;
+static constexpr int MAX_DEPTH   = 100;
 
 static constexpr int MAX_PLY     = 64;   
 static constexpr int MAX_KILLERS = 2; 
@@ -526,7 +527,7 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     if (moves.empty()) {
         if (isInCheck(gs, gs.whiteToMove))
-            return -(MATE_SCORE - ply);   
+            return (MAX_DEPTH - depth)-(MATE_SCORE - ply);   
         return DRAW_SCORE;
     }
 

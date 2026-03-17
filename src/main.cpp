@@ -407,7 +407,7 @@ int main()
         }
 
         if (isAIThinking) {
-            sf::Text aiStatusText(font); // Initialized with font here
+            sf::Text aiStatusText(font);
             aiStatusText.setString("AI is thinking...");
             aiStatusText.setCharacterSize(20);
             aiStatusText.setFillColor(sf::Color::Blue);
