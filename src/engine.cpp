@@ -20,6 +20,8 @@ static constexpr int MATE_SCORE  =  1000000;
 static constexpr int DRAW_SCORE  =  0;
 static constexpr int MAX_DEPTH   = 100;
 static constexpr int DEFAULT_HASH_MB = 16;
+static constexpr int QSEARCH_MAX_DEPTH = 40;
+static constexpr int QSEARCH_CHECK_DEPTH = 3;
 
 inline int rowOfSq(int sq) { return sq / 8; }
 inline int colOfSq(int sq) { return sq % 8; }
@@ -136,6 +138,54 @@ int pieceValue(int pt)
         case K: return 20000;
         default: return 0;
     }
+}
+
+static int sideHangingDanger(const GameState& gs, bool white)
+{
+    int danger = 0;
+
+    for (int sq = 0; sq < 64; ++sq) {
+        const Piece p = pieceAtSq(gs, sq);
+        if (p.type == EMPTY || p.type == K || p.white != white) {
+            continue;
+        }
+
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        const bool attackedByEnemy = isSquareAttacked(gs, r, c, !white);
+        if (!attackedByEnemy) {
+            continue;
+        }
+
+        const bool defendedByOwn = isSquareAttacked(gs, r, c, white);
+
+        int unit = 0;
+        switch (p.type) {
+            case P: unit = 8; break;
+            case N: unit = 24; break;
+            case B: unit = 28; break;
+            case R: unit = 42; break;
+            case Q: unit = 64; break;
+            default: break;
+        }
+
+        danger += unit;
+        if (!defendedByOwn) {
+            danger += unit;
+            if (p.type == B || p.type == Q) {
+                danger += 12;
+            }
+        }
+    }
+
+    return danger;
+}
+
+static int hangingPieceScore(const GameState& gs)
+{
+    const int whiteDanger = sideHangingDanger(gs, true);
+    const int blackDanger = sideHangingDanger(gs, false);
+    return blackDanger - whiteDanger;
 }
 
 struct Zobrist {
@@ -267,11 +317,8 @@ struct SearchState {
     int hashCount = 0;
     int  nodes = 0;
     std::array<int, 1024> evalCoreNoKingStack{};
-    std::array<std::array<int16_t, 256>, 1024> nnueAccWhiteStack{};
-    std::array<std::array<int16_t, 256>, 1024> nnueAccBlackStack{};
     int evalPly = 0;
     bool evalActive = false;
-    bool nnueAccActive = false;
     bool stopped = false;
     std::chrono::steady_clock::time_point startTime;
     int  timeLimitMs = 5000;
@@ -281,7 +328,6 @@ struct SearchState {
         hashCount = 0;
         evalPly = 0;
         evalActive = false;
-        nnueAccActive = false;
         stopped = false;
         for (auto& ply : killers)
             for (auto& k : ply)
@@ -311,206 +357,6 @@ struct SearchState {
 } static ss;
 
 static SearchStats lastSearchStats;
-
-static constexpr std::uint32_t STOCKFISH_NNUE_MAGIC = 0x7AF32F20u;
-static constexpr int NNUE_INPUTS = 12 * 64;
-static constexpr int NNUE_HIDDEN = 256;
-
-struct NnueState {
-    bool useNnue = false;
-    bool loaded = false;
-    std::string evalFile;
-    std::string description;
-    std::array<int16_t, NNUE_HIDDEN> b1{};
-    std::array<std::array<int16_t, NNUE_HIDDEN>, NNUE_INPUTS> w1{};
-    std::array<int16_t, NNUE_HIDDEN * 2> wOut{};
-    int32_t bOut = 0;
-};
-
-static NnueState g_nnue;
-
-static inline std::uint32_t readU32LE(const std::vector<std::uint8_t>& buf, size_t off)
-{
-    return static_cast<std::uint32_t>(buf[off])
-        | (static_cast<std::uint32_t>(buf[off + 1]) << 8)
-        | (static_cast<std::uint32_t>(buf[off + 2]) << 16)
-        | (static_cast<std::uint32_t>(buf[off + 3]) << 24);
-}
-
-static inline int16_t foldToWeight(std::uint16_t raw, int span)
-{
-    const int width = 2 * span + 1;
-    int v = static_cast<int>(raw % static_cast<std::uint16_t>(width)) - span;
-    return static_cast<int16_t>(v);
-}
-
-static bool loadStockfishCompatibleNnue(const std::string& path)
-{
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) {
-        g_nnue.loaded = false;
-        return false;
-    }
-
-    const std::streamsize size = in.tellg();
-    if (size < 2048) {
-        g_nnue.loaded = false;
-        return false;
-    }
-    in.seekg(0, std::ios::beg);
-
-    std::vector<std::uint8_t> bytes(static_cast<size_t>(size));
-    if (!in.read(reinterpret_cast<char*>(bytes.data()), size)) {
-        g_nnue.loaded = false;
-        return false;
-    }
-
-    if (bytes.size() < 16) {
-        g_nnue.loaded = false;
-        return false;
-    }
-
-    const std::uint32_t magic = readU32LE(bytes, 0);
-    if (magic != STOCKFISH_NNUE_MAGIC) {
-        g_nnue.loaded = false;
-        return false;
-    }
-
-    const std::uint32_t descLen = readU32LE(bytes, 8);
-    const size_t descStart = 12;
-    const size_t descEnd = descStart + static_cast<size_t>(descLen);
-    if (descLen > 4096 || descEnd > bytes.size()) {
-        g_nnue.loaded = false;
-        return false;
-    }
-
-    g_nnue.description.assign(reinterpret_cast<const char*>(bytes.data() + descStart),
-                              reinterpret_cast<const char*>(bytes.data() + descEnd));
-
-    size_t payloadStart = descEnd;
-    if (payloadStart + 2 >= bytes.size()) {
-        g_nnue.loaded = false;
-        return false;
-    }
-
-    auto nextU16 = [&]() -> std::uint16_t {
-        const std::uint8_t lo = bytes[payloadStart++];
-        if (payloadStart >= bytes.size()) payloadStart = descEnd;
-        const std::uint8_t hi = bytes[payloadStart++];
-        if (payloadStart >= bytes.size()) payloadStart = descEnd;
-        return static_cast<std::uint16_t>(lo | (static_cast<std::uint16_t>(hi) << 8));
-    };
-
-    for (int i = 0; i < NNUE_HIDDEN; ++i) {
-        g_nnue.b1[i] = foldToWeight(nextU16(), 24);
-    }
-    for (int f = 0; f < NNUE_INPUTS; ++f) {
-        for (int i = 0; i < NNUE_HIDDEN; ++i) {
-            g_nnue.w1[f][i] = foldToWeight(nextU16(), 16);
-        }
-    }
-    for (int i = 0; i < NNUE_HIDDEN * 2; ++i) {
-        g_nnue.wOut[i] = foldToWeight(nextU16(), 64);
-    }
-    g_nnue.bOut = static_cast<int32_t>(foldToWeight(nextU16(), 160));
-
-    g_nnue.evalFile = path;
-    g_nnue.loaded = true;
-    return true;
-}
-
-static inline int nnueFeatureIndex(bool whitePerspective, const Piece& p, int sq)
-{
-    const int mappedSq = whitePerspective ? sq : (sq ^ 56);
-    const int color = whitePerspective ? (p.white ? 0 : 1) : (p.white ? 1 : 0);
-    return ((color * 6) + (p.type - 1)) * 64 + mappedSq;
-}
-
-static inline void nnueApplyFeatureDelta(std::array<int16_t, NNUE_HIDDEN>& acc, int featureIndex, int sign)
-{
-    const auto& row = g_nnue.w1[featureIndex];
-    for (int i = 0; i < NNUE_HIDDEN; ++i) {
-        acc[i] = static_cast<int16_t>(acc[i] + sign * row[i]);
-    }
-}
-
-static inline void nnueApplyPieceDelta(std::array<int16_t, NNUE_HIDDEN>& accWhite,
-                                       std::array<int16_t, NNUE_HIDDEN>& accBlack,
-                                       const Piece& p,
-                                       int sq,
-                                       int sign)
-{
-    if (p.type == EMPTY) {
-        return;
-    }
-    nnueApplyFeatureDelta(accWhite, nnueFeatureIndex(true, p, sq), sign);
-    nnueApplyFeatureDelta(accBlack, nnueFeatureIndex(false, p, sq), sign);
-}
-
-static void nnueBuildAccumulators(const GameState& gs,
-                                  std::array<int16_t, NNUE_HIDDEN>& accWhite,
-                                  std::array<int16_t, NNUE_HIDDEN>& accBlack)
-{
-    accWhite = g_nnue.b1;
-    accBlack = g_nnue.b1;
-
-    for (int sq = 0; sq < 64; ++sq) {
-        const Piece p = pieceAtSq(gs, sq);
-        if (p.type == EMPTY) {
-            continue;
-        }
-        nnueApplyPieceDelta(accWhite, accBlack, p, sq, +1);
-    }
-}
-
-static bool nnueApplyMoveDelta(const GameState& gs,
-                               const Move& m,
-                               std::array<int16_t, NNUE_HIDDEN>& childWhite,
-                               std::array<int16_t, NNUE_HIDDEN>& childBlack)
-{
-    const int fromSq = m.from();
-    const int toSq = m.to();
-    const Piece moving = pieceAtSq(gs, fromSq);
-    if (moving.type == EMPTY) {
-        return false;
-    }
-
-    nnueApplyPieceDelta(childWhite, childBlack, moving, fromSq, -1);
-
-    if (m.isEnPassant()) {
-        const int capSq = rowOfSq(fromSq) * 8 + colOfSq(toSq);
-        const Piece captured = pieceAtSq(gs, capSq);
-        nnueApplyPieceDelta(childWhite, childBlack, captured, capSq, -1);
-    } else {
-        const Piece captured = pieceAtSq(gs, toSq);
-        nnueApplyPieceDelta(childWhite, childBlack, captured, toSq, -1);
-    }
-
-    if (m.isCastle()) {
-        const int toR = rowOfSq(toSq);
-        if (colOfSq(toSq) == 6) {
-            const int rookFrom = toR * 8 + 7;
-            const int rookTo = toR * 8 + 5;
-            const Piece rook = pieceAtSq(gs, rookFrom);
-            nnueApplyPieceDelta(childWhite, childBlack, rook, rookFrom, -1);
-            nnueApplyPieceDelta(childWhite, childBlack, rook, rookTo, +1);
-        } else {
-            const int rookFrom = toR * 8 + 0;
-            const int rookTo = toR * 8 + 3;
-            const Piece rook = pieceAtSq(gs, rookFrom);
-            nnueApplyPieceDelta(childWhite, childBlack, rook, rookFrom, -1);
-            nnueApplyPieceDelta(childWhite, childBlack, rook, rookTo, +1);
-        }
-    }
-
-    Piece placed = moving;
-    if (m.isPromotion()) {
-        placed.type = m.promotionType();
-    }
-    nnueApplyPieceDelta(childWhite, childBlack, placed, toSq, +1);
-
-    return true;
-}
 
 static int squareFromCoord(const std::string& s, int start)
 {
@@ -829,20 +675,28 @@ static bool isEndgame(const GameState& gs)
     return mat < 1800;
 }
 
+static inline bool hasNonPawnMaterial(const GameState& gs, bool white)
+{
+    const int side = white ? 0 : 1;
+    return (gs.bitboards[side][N - 1]
+            | gs.bitboards[side][B - 1]
+            | gs.bitboards[side][R - 1]
+            | gs.bitboards[side][Q - 1]) != 0;
+}
+
 static int phaseDepthBonus(const GameState& gs)
 {
     // Use non-pawn material as a cheap phase proxy.
-    int npm = 0;
-    npm += pieceValue(P) * (popcount64(gs.bitboards[0][P - 1]) + popcount64(gs.bitboards[1][P - 1]));
-    npm += pieceValue(N) * (popcount64(gs.bitboards[0][N - 1]) + popcount64(gs.bitboards[1][N - 1]));
-    npm += pieceValue(B) * (popcount64(gs.bitboards[0][B - 1]) + popcount64(gs.bitboards[1][B - 1]));
-    npm += pieceValue(R) * (popcount64(gs.bitboards[0][R - 1]) + popcount64(gs.bitboards[1][R - 1]));
-    npm += pieceValue(Q) * (popcount64(gs.bitboards[0][Q - 1]) + popcount64(gs.bitboards[1][Q - 1]));
+    int nonPawnMaterial = 0;
+    nonPawnMaterial += pieceValue(N) * (popcount64(gs.bitboards[0][N - 1]) + popcount64(gs.bitboards[1][N - 1]));
+    nonPawnMaterial += pieceValue(B) * (popcount64(gs.bitboards[0][B - 1]) + popcount64(gs.bitboards[1][B - 1]));
+    nonPawnMaterial += pieceValue(R) * (popcount64(gs.bitboards[0][R - 1]) + popcount64(gs.bitboards[1][R - 1]));
+    nonPawnMaterial += pieceValue(Q) * (popcount64(gs.bitboards[0][Q - 1]) + popcount64(gs.bitboards[1][Q - 1]));
 
     // Opening -> middlegame -> middle-endgame -> endgame.
-    if (npm >= 5000) return 0;
-    if (npm >= 3000) return 2;
-    if (npm >= 2000) return 4;
+    if (nonPawnMaterial >= 5000) return 0;
+    if (nonPawnMaterial >= 3000) return 2;
+    if (nonPawnMaterial >= 2000) return 4;
     return 6;
 }
 
@@ -1174,36 +1028,6 @@ static int computeCoreEvalNoKing(const GameState& gs)
     return score;
 }
 
-static inline int nnueClip(int x)
-{
-    if (x < 0) return 0;
-    if (x > 127) return 127;
-    return x;
-}
-
-static int evaluateNnueAccumulator(const std::array<int16_t, NNUE_HIDDEN>& accWhite,
-                                   const std::array<int16_t, NNUE_HIDDEN>& accBlack,
-                                   bool whiteToMove)
-{
-    int sum = g_nnue.bOut;
-
-    for (int i = 0; i < NNUE_HIDDEN; ++i) {
-        sum += nnueClip(accWhite[i]) * g_nnue.wOut[i];
-        sum += nnueClip(accBlack[i]) * g_nnue.wOut[NNUE_HIDDEN + i];
-    }
-
-    int score = sum / 64;
-    return whiteToMove ? score : -score;
-}
-
-static int evaluateNnueFromBoard(const GameState& gs)
-{
-    std::array<int16_t, NNUE_HIDDEN> accWhite{};
-    std::array<int16_t, NNUE_HIDDEN> accBlack{};
-    nnueBuildAccumulators(gs, accWhite, accBlack);
-    return evaluateNnueAccumulator(accWhite, accBlack, gs.whiteToMove);
-}
-
 static int kingPstMiddleScore(const GameState& gs)
 {
     const int wKingSq = lsbSquare64(gs.bitboards[0][K - 1]);
@@ -1386,24 +1210,13 @@ static int computeMoveCoreDeltaNoKing(const GameState& gs, const Move& m)
 static inline void searchMakeMove(GameState& gs, const Move& m)
 {
     const bool hasRoom = (ss.evalPly + 1 < static_cast<int>(ss.evalCoreNoKingStack.size()));
-    if ((ss.evalActive || ss.nnueAccActive) && hasRoom) {
-        if (ss.evalActive) {
-            const int delta = computeMoveCoreDeltaNoKing(gs, m);
-            ss.evalCoreNoKingStack[ss.evalPly + 1] = ss.evalCoreNoKingStack[ss.evalPly] + delta;
-        }
-
-        if (ss.nnueAccActive) {
-            ss.nnueAccWhiteStack[ss.evalPly + 1] = ss.nnueAccWhiteStack[ss.evalPly];
-            ss.nnueAccBlackStack[ss.evalPly + 1] = ss.nnueAccBlackStack[ss.evalPly];
-            if (!nnueApplyMoveDelta(gs, m, ss.nnueAccWhiteStack[ss.evalPly + 1], ss.nnueAccBlackStack[ss.evalPly + 1])) {
-                ss.nnueAccActive = false;
-            }
-        }
+    if (ss.evalActive && hasRoom) {
+        const int delta = computeMoveCoreDeltaNoKing(gs, m);
+        ss.evalCoreNoKingStack[ss.evalPly + 1] = ss.evalCoreNoKingStack[ss.evalPly] + delta;
 
         ++ss.evalPly;
     } else {
         ss.evalActive = false;
-        ss.nnueAccActive = false;
     }
     makeMove(gs, m, false);
 }
@@ -1414,6 +1227,38 @@ static inline void searchUndoMove(GameState& gs)
     if (ss.evalPly > 0) {
         --ss.evalPly;
     }
+}
+
+struct NullMoveState {
+    bool whiteToMove = true;
+    std::optional<std::pair<int, int>> enPassantTarget;
+    int halfmoveClock = 0;
+    int fullmoveNumber = 1;
+};
+
+static inline NullMoveState doNullMove(GameState& gs)
+{
+    NullMoveState st;
+    st.whiteToMove = gs.whiteToMove;
+    st.enPassantTarget = gs.enPassantTarget;
+    st.halfmoveClock = gs.halfmoveClock;
+    st.fullmoveNumber = gs.fullmoveNumber;
+
+    gs.enPassantTarget = std::nullopt;
+    gs.halfmoveClock++;
+    if (!gs.whiteToMove) {
+        gs.fullmoveNumber++;
+    }
+    gs.whiteToMove = !gs.whiteToMove;
+    return st;
+}
+
+static inline void undoNullMove(GameState& gs, const NullMoveState& st)
+{
+    gs.whiteToMove = st.whiteToMove;
+    gs.enPassantTarget = st.enPassantTarget;
+    gs.halfmoveClock = st.halfmoveClock;
+    gs.fullmoveNumber = st.fullmoveNumber;
 }
 
 static bool isKRK(const GameState& gs, bool whiteHasRook)
@@ -1622,17 +1467,65 @@ static int kqkFamilyBonus(const GameState& gs, bool whiteHasQueen)
     return whiteHasQueen ? bonus : -bonus;
 }
 
-static int evaluate(const GameState& gs)
+static int neuralAwarenessScore(const GameState& gs,
+                                int baseScore,
+                                int pawnStructure,
+                                int rookOpenFile,
+                                int bishopPair,
+                                int mobility,
+                                int kingSafety,
+                                int openingScore,
+                                int phase)
 {
-    if (g_nnue.useNnue && g_nnue.loaded) {
-        if (ss.nnueAccActive) {
-            return evaluateNnueAccumulator(ss.nnueAccWhiteStack[ss.evalPly],
-                                           ss.nnueAccBlackStack[ss.evalPly],
-                                           gs.whiteToMove);
+    // Tiny embedded MLP for global positional awareness.
+    // Inputs are intentionally coarse to keep this very fast.
+    std::array<int, 12> x{};
+    x[0] = std::clamp(baseScore / 100, -64, 64);
+    x[1] = std::clamp(pawnStructure / 30, -32, 32);
+    x[2] = std::clamp(rookOpenFile / 20, -32, 32);
+    x[3] = std::clamp(bishopPair / 30, -8, 8);
+    x[4] = std::clamp(mobility / 25, -48, 48);
+    x[5] = std::clamp(kingSafety / 20, -48, 48);
+    x[6] = std::clamp(openingScore / 20, -32, 32);
+    x[7] = std::clamp(phase - 12, -12, 12);
+    x[8] = popcount64(gs.bitboards[0][Q - 1]) - popcount64(gs.bitboards[1][Q - 1]);
+    x[9] = popcount64(gs.bitboards[0][R - 1]) - popcount64(gs.bitboards[1][R - 1]);
+    x[10] = popcount64(gs.bitboards[0][B - 1]) - popcount64(gs.bitboards[1][B - 1]);
+    x[11] = popcount64(gs.bitboards[0][N - 1]) - popcount64(gs.bitboards[1][N - 1]);
+
+    static constexpr int H = 8;
+    static constexpr std::array<std::array<int, 12>, H> W1 = {{
+        {{ 7, 5, 2, 4, 3, 6, 2, -1, 4, 3, 2, 2 }},
+        {{ 5, 2, 4, 1, 6, 3, 1, -2, 2, 4, 2, 3 }},
+        {{ 3, 6, 1, 2, 2, 5, 4, 1, 1, 2, 3, 3 }},
+        {{ 4, 1, 5, 2, 3, 2, 6, 2, 2, 3, 1, 1 }},
+        {{ 6, 3, 2, 3, 5, 1, 1, -1, 3, 2, 2, 4 }},
+        {{ 2, 4, 3, 2, 1, 6, 3, 1, 1, 2, 4, 2 }},
+        {{ 5, 2, 2, 5, 2, 3, 2, -2, 4, 1, 2, 2 }},
+        {{ 3, 5, 1, 2, 4, 2, 3, 0, 2, 3, 2, 1 }}
+    }};
+    static constexpr std::array<int, H> B1 = {{ 6, 4, 5, 3, 4, 5, 4, 3 }};
+    static constexpr std::array<int, H> W2 = {{ 11, 9, 8, 8, 10, 7, 9, 8 }};
+    static constexpr int B2 = 0;
+
+    int out = B2;
+    for (int i = 0; i < H; ++i) {
+        int h = B1[i];
+        for (int j = 0; j < static_cast<int>(x.size()); ++j) {
+            h += W1[i][j] * x[j];
         }
-        return evaluateNnueFromBoard(gs);
+        if (h < 0) {
+            h = 0;
+        }
+        out += W2[i] * h;
     }
 
+    // Keep this term bounded and well-behaved vs handcrafted eval.
+    return std::clamp(out / 64, -120, 120);
+}
+
+static int evaluate(const GameState& gs)
+{
     int baseScore = ss.evalActive ? ss.evalCoreNoKingStack[ss.evalPly] : computeCoreEvalNoKing(gs);
     bool eg = isEndgame(gs);
     const int phase = gamePhase24(gs);
@@ -1655,15 +1548,34 @@ static int evaluate(const GameState& gs)
     mgScore += bishopPair;
     egScore += bishopPair;
 
+    const int hanging = hangingPieceScore(gs);
+    mgScore += hanging;
+    egScore += hanging / 2;
+
     const int mob = mobilityScore(gs);
     mgScore += mob;
     egScore += mob / 2;
 
-    mgScore += lightweightKingSafetyScore(gs, false);
+    const int kingSafety = lightweightKingSafetyScore(gs, false);
+    mgScore += kingSafety;
 
+    int openingScore = 0;
     if (!eg) {
-        mgScore += openingPrinciplesScore(gs);
+        openingScore = openingPrinciplesScore(gs);
+        mgScore += openingScore;
     }
+
+    const int awareness = neuralAwarenessScore(gs,
+                                               baseScore,
+                                               pawnStructure,
+                                               rookOpenFile,
+                                               bishopPair,
+                                               mob,
+                                               kingSafety,
+                                               openingScore,
+                                               phase);
+    mgScore += awareness;
+    egScore += awareness / 2;
 
     egScore += rookEndgameOffset(gs);
 
@@ -1852,6 +1764,31 @@ static void generateTacticalLegalMoves(GameState& gs, MoveList& out)
         undoMove(gs, false);
 
         if (legal && out.count < static_cast<int>(out.moves.size())) {
+            out.moves[out.count++] = m;
+        }
+    }
+}
+
+static void generateQuietCheckingMoves(GameState& gs, MoveList& out)
+{
+    out.clear();
+
+    MoveList pseudo;
+    generatePseudoLegalMoves(gs, pseudo);
+    const bool sideToCheck = gs.whiteToMove;
+
+    for (int i = 0; i < pseudo.count; ++i) {
+        const Move& m = pseudo.moves[i];
+        if (m.isCapture() || m.isPromotion()) {
+            continue;
+        }
+
+        makeMove(gs, m, false);
+        const bool legal = !isInCheck(gs, sideToCheck);
+        const bool givesCheck = legal && isInCheck(gs, gs.whiteToMove);
+        undoMove(gs, false);
+
+        if (givesCheck && out.count < static_cast<int>(out.moves.size())) {
             out.moves[out.count++] = m;
         }
     }
@@ -2047,11 +1984,35 @@ static int staticExchangeEval(const GameState& gs, const Move& m)
     return gain[0];
 }
 
-static int quiescence(GameState& gs, int alpha, int beta, int ply)
+static int quiescence(GameState& gs, int alpha, int beta, int ply, int qDepth)
 {
     ss.nodes++;
 
+    const int alphaOrig = alpha;
+    const uint64_t hash = computeHash(gs);
+    TTEntry* entry = tt.probe(hash);
+    Move ttBestMove = invalidMove();
+    if (entry) {
+        ttBestMove = entry->bestMove;
+        if (entry->depth <= 0) {
+            const int ttScore = scoreFromTT(entry->score, ply);
+            if (entry->flag == TT_EXACT) {
+                return ttScore;
+            }
+            if (entry->flag == TT_LOWER && ttScore >= beta) {
+                return ttScore;
+            }
+            if (entry->flag == TT_UPPER && ttScore <= alpha) {
+                return ttScore;
+            }
+        }
+    }
+
     const bool inCheck = isInCheck(gs, gs.whiteToMove);
+
+    if (qDepth >= QSEARCH_MAX_DEPTH || ply >= 254) {
+        return evaluate(gs);
+    }
 
     if (inCheck) {
         MoveList evasions;
@@ -2060,45 +2021,97 @@ static int quiescence(GameState& gs, int alpha, int beta, int ply)
             return -(MATE_SCORE - ply);
         }
 
-        Move dummy = invalidMove();
-        sortMoves(evasions, gs, ply, dummy);
+        sortMoves(evasions, gs, ply, ttBestMove);
 
         for (int i = 0; i < evasions.count; ++i) {
             Move& m = evasions.moves[i];
             searchMakeMove(gs, m);
-            int score = -quiescence(gs, -beta, -alpha, ply + 1);
+            int score = -quiescence(gs, -beta, -alpha, ply + 1, qDepth + 1);
             searchUndoMove(gs);
 
-            if (score >= beta) return beta;
+            if (score >= beta) {
+                tt.store(hash, scoreToTT(beta, ply), 0, TT_LOWER, m);
+                return beta;
+            }
             if (score > alpha) alpha = score;
         }
+
+        const TTFlag flag = (alpha <= alphaOrig) ? TT_UPPER : TT_EXACT;
+        tt.store(hash, scoreToTT(alpha, ply), 0, flag, invalidMove());
         return alpha;
     }
 
     int stand_pat = evaluate(gs);
 
-    if (stand_pat >= beta) return beta;
+    if (stand_pat >= beta) {
+        tt.store(hash, scoreToTT(beta, ply), 0, TT_LOWER, invalidMove());
+        return beta;
+    }
     if (stand_pat > alpha)  alpha = stand_pat;
 
     MoveList moves;
     generateTacticalLegalMoves(gs, moves);
 
-    Move dummy = invalidMove();
-    sortMoves(moves, gs, 0, dummy);
+    sortMoves(moves, gs, ply, ttBestMove);
 
     for (int i = 0; i < moves.count; ++i) {
         Move& m = moves.moves[i];
-        if (m.isCapture() && !m.isEnPassant() && staticExchangeEval(gs, m) < 0) {
+        if (m.isCapture()) {
+            int captured = pieceValue(m.capturedType());
+            if (captured == 0 && !m.isEnPassant()) {
+                captured = pieceValue(pieceAtSq(gs, m.to()).type);
+            }
+
+            int promotionGain = 0;
+            if (m.isPromotion()) {
+                promotionGain = pieceValue(m.promotionType()) - pieceValue(P);
+            }
+
+            // Delta pruning: skip tactical moves that cannot raise alpha enough.
+            if (stand_pat + captured + promotionGain + 180 <= alpha) {
+                continue;
+            }
+        }
+
+        if (m.isCapture() && !m.isEnPassant() && staticExchangeEval(gs, m) < -90) {
             continue;
         }
 
         searchMakeMove(gs, m);
-        int score = -quiescence(gs, -beta, -alpha, ply + 1);
+        int score = -quiescence(gs, -beta, -alpha, ply + 1, qDepth + 1);
         searchUndoMove(gs);
 
-        if (score >= beta) return beta;
+        if (score >= beta) {
+            tt.store(hash, scoreToTT(beta, ply), 0, TT_LOWER, m);
+            return beta;
+        }
         if (score > alpha)  alpha = score;
     }
+
+    if (qDepth < QSEARCH_CHECK_DEPTH) {
+        MoveList checks;
+        generateQuietCheckingMoves(gs, checks);
+        sortMoves(checks, gs, ply, ttBestMove);
+
+        for (int i = 0; i < checks.count; ++i) {
+            Move& m = checks.moves[i];
+
+            searchMakeMove(gs, m);
+            int score = -quiescence(gs, -beta, -alpha, ply + 1, qDepth + 1);
+            searchUndoMove(gs);
+
+            if (score >= beta) {
+                tt.store(hash, scoreToTT(beta, ply), 0, TT_LOWER, m);
+                return beta;
+            }
+            if (score > alpha) {
+                alpha = score;
+            }
+        }
+    }
+
+    const TTFlag flag = (alpha <= alphaOrig) ? TT_UPPER : TT_EXACT;
+    tt.store(hash, scoreToTT(alpha, ply), 0, flag, invalidMove());
     return alpha;
 }
 
@@ -2157,14 +2170,24 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
         depth += 1;
     }
 
-    if (depth == 0) return quiescence(gs, alpha, beta, ply);
+    if (depth == 0) return quiescence(gs, alpha, beta, ply, 0);
 
     int staticEval = 0;
+    int tacticalDanger = 0;
     if (!inCheck) {
         staticEval = evaluate(gs);
+        tacticalDanger = sideHangingDanger(gs, gs.whiteToMove);
+
+        if (!pvNode && depth <= 2) {
+            const int margin = 180 + depth * 110;
+            if (tacticalDanger < 56 && staticEval - margin >= beta) {
+                return staticEval;
+            }
+        }
+
         if (depth == 1) {
-            const int rfpMargin = 80;
-            if (staticEval - rfpMargin >= beta) {
+            const int rfpMargin = 150;
+            if (tacticalDanger < 56 && staticEval - rfpMargin >= beta) {
                 return staticEval;
             }
         }
@@ -2179,12 +2202,15 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
         return DRAW_SCORE;
     }
 
-    if (nullMoveAllowed && depth >= 3 && !inCheck && !isEndgame(gs))
+    if (nullMoveAllowed && depth >= 3 && !inCheck && hasNonPawnMaterial(gs, gs.whiteToMove))
     {
-        gs.whiteToMove = !gs.whiteToMove;
-        int R = (depth >= 6) ? 3 : 2;
+        const NullMoveState nullState = doNullMove(gs);
+        int R = 2;
+        if (depth >= 9 && staticEval >= beta + 120) {
+            R = 3;
+        }
         int nullScore = -negamax(gs, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
-        gs.whiteToMove = !gs.whiteToMove;
+        undoNullMove(gs, nullState);
 
         if (!ss.stopped && nullScore >= beta)
             return beta;
@@ -2198,7 +2224,8 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
     int  moveCount = 0;
     std::array<Move, 64> quietTried{};
     int quietTriedCount = 0;
-    const bool useFutility = !inCheck && depth == 1;
+    const bool highTacticalDanger = tacticalDanger >= 56;
+    const bool useFutility = !inCheck && depth == 1 && !highTacticalDanger;
     const int futilityBase = staticEval;
 
     for (int i = 0; i < moves.count; ++i) {
@@ -2213,8 +2240,8 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             }
         }
 
-        if (!pvNode && !inCheck && quietMove && depth <= 4 && moveCount > (2 + depth * 3)) {
-            const int lmpMargin = 140 + depth * 100;
+        if (!pvNode && !inCheck && !highTacticalDanger && quietMove && depth <= 3 && moveCount > (4 + depth * 4)) {
+            const int lmpMargin = 180 + depth * 120;
             if (futilityBase + lmpMargin <= alpha) {
                 continue;
             }
@@ -2240,11 +2267,15 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
         int score;
         if (moveCount == 1) {
             score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
-        } else if (!pvNode && quietMove && depth >= 3 && moveCount > 3 && !givesCheck) {
+        } else if (!pvNode && quietMove && depth >= 4 && moveCount > 4 && !givesCheck) {
             int reduction = 1;
             if (moveCount > 8) reduction++;
-            if (depth >= 6 && moveCount > 14) reduction++;
+            if (moveCount > 16) reduction++;
+            if (depth >= 8 && moveCount > 20) reduction++;
             if (quietHistory > 8000 && reduction > 1) reduction--;
+            if (quietHistory < -4000 && reduction < depth - 2) reduction++;
+            reduction = std::min(reduction, depth - 2);
+            if (highTacticalDanger && reduction > 1) reduction--;
 
             if (ply > 0 && ply < static_cast<int>(ss.pathMoves.size())) {
                 const Move& prev = ss.pathMoves[ply - 1];
@@ -2329,15 +2360,9 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
     ss.startTime   = std::chrono::steady_clock::now();
     ss.timeLimitMs = timeLimitMs;
     ss.hashHistory[ss.hashCount++] = computeHash(gs);
-    ss.nnueAccActive = (g_nnue.useNnue && g_nnue.loaded);
-    ss.evalActive = !ss.nnueAccActive;
+    ss.evalActive = true;
     ss.evalPly = 0;
-    if (ss.evalActive) {
-        ss.evalCoreNoKingStack[0] = computeCoreEvalNoKing(gs);
-    }
-    if (ss.nnueAccActive) {
-        nnueBuildAccumulators(gs, ss.nnueAccWhiteStack[0], ss.nnueAccBlackStack[0]);
-    }
+    ss.evalCoreNoKingStack[0] = computeCoreEvalNoKing(gs);
 
     maxDepth += phaseDepthBonus(gs);
     const int rootEval = evaluate(gs);
@@ -2496,31 +2521,6 @@ void requestStopSearch()
 void clearStopSearch()
 {
     g_stopRequested.store(false, std::memory_order_relaxed);
-}
-
-bool setNnueEvalFile(const std::string& path)
-{
-    return loadStockfishCompatibleNnue(path);
-}
-
-void setUseNnue(bool enable)
-{
-    g_nnue.useNnue = enable;
-}
-
-bool isUseNnue()
-{
-    return g_nnue.useNnue;
-}
-
-bool isNnueReady()
-{
-    return g_nnue.loaded;
-}
-
-std::string getNnueEvalFile()
-{
-    return g_nnue.evalFile;
 }
 
 void setHashSizeMb(int mb)

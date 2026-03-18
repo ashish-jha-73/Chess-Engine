@@ -128,8 +128,6 @@ static int runUciLoop()
     setHashSizeMb(optionHashMb);
     optionHashMb = getHashSizeMb();
     int optionThreads = 1;
-    bool optionUseNnue = isUseNnue();
-    std::string optionEvalFile = getNnueEvalFile();
 
     std::thread searchThread;
     std::atomic<bool> searchRunning { false };
@@ -159,13 +157,8 @@ static int runUciLoop()
             std::cout << "option name Hash type spin default 16 min 1 max 2048\n";
             std::cout << "option name Threads type spin default 1 min 1 max 1\n";
             std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
-            std::cout << "option name UseNNUE type check default " << (optionUseNnue ? "true" : "false") << "\n";
-            std::cout << "option name EvalFile type string default " << optionEvalFile << "\n";
             std::cout << "uciok\n";
         } else if (cmd == "isready") {
-            if (optionUseNnue) {
-                std::cout << "info string nnue " << (isNnueReady() ? "loaded" : "fallback-classical") << "\n";
-            }
             std::cout << "readyok\n";
         } else if (cmd == "ucinewgame") {
             stopAndJoinSearch();
@@ -316,15 +309,6 @@ static int runUciLoop()
             } else if (lname == "threads" && !value.empty()) {
                 optionThreads = std::clamp(std::stoi(value), 1, 1);
                 (void)optionThreads;
-            } else if (lname == "usennue") {
-                const std::string lv = lower(value);
-                const bool enabled = (lv == "true" || lv == "1" || lv == "on");
-                optionUseNnue = enabled;
-                setUseNnue(enabled);
-            } else if (lname == "evalfile" && !value.empty()) {
-                optionEvalFile = value;
-                const bool ok = setNnueEvalFile(optionEvalFile);
-                std::cout << "info string nnue-load " << (ok ? "ok" : "failed") << " file " << optionEvalFile << "\n";
             }
         } else if (cmd == "ponderhit") {
             // Ponder is treated as infinite search in this engine; stop/next go controls it.
@@ -371,10 +355,6 @@ bool sameMoveFromTo(const Move& a, const Move& b)
 
 int main(int argc, char** argv)
 {
-    const std::string defaultNnue = "assets/nn-c288c895ea92.nnue";
-    const bool nnueLoaded = setNnueEvalFile(defaultNnue);
-    setUseNnue(nnueLoaded);
-
     const std::string modeArg = (argc > 1) ? std::string(argv[1]) : std::string();
     const bool graphicsMode = (modeArg == "--graphics" || modeArg == "--gui");
 
