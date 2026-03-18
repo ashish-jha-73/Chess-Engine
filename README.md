@@ -59,7 +59,7 @@ make run
 or 
 
 ```bash
-bash chessgame
+./chessgame --graphics
 ```
 
 ---

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chess.hpp"
+#include <string>
 
 struct SearchStats {
 	int nodes = 0;
@@ -13,3 +14,12 @@ struct SearchStats {
 Move computeBestMove(GameState gs, int depth);
 Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs);
 SearchStats getLastSearchStats();
+void requestStopSearch();
+void clearStopSearch();
+bool setNnueEvalFile(const std::string& path);
+void setUseNnue(bool enable);
+bool isUseNnue();
+bool isNnueReady();
+std::string getNnueEvalFile();
+void setHashSizeMb(int mb);
+int getHashSizeMb();

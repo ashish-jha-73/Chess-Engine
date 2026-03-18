@@ -26,7 +26,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 
 run: $(TARGET)
 	@echo -e "$(CYAN)🚀 Running Chess Game...$(RESET)"
-	@./$(TARGET)
+	@./$(TARGET) --graphics
 
 clean:
 	@echo -e "$(CYAN)🧹 Cleaning build files...$(RESET)"

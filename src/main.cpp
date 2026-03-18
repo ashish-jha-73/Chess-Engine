@@ -10,6 +10,8 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <sstream>
+#include <algorithm>
 
 #include "../include/chess.hpp"
 #include "../include/engine.hpp"
@@ -17,6 +19,326 @@
 using namespace std;
 
 bool inBounds(int r, int c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
+
+static int parseSquare(const std::string& s)
+{
+    if (s.size() != 2) return -1;
+    const int file = s[0] - 'a';
+    const int rank = s[1] - '1';
+    if (file < 0 || file > 7 || rank < 0 || rank > 7) return -1;
+    const int row = 7 - rank;
+    return row * 8 + file;
+}
+
+static std::string squareToUci(int sq)
+{
+    const int row = sq / 8;
+    const int col = sq % 8;
+    std::string out;
+    out.push_back(static_cast<char>('a' + col));
+    out.push_back(static_cast<char>('8' - row));
+    return out;
+}
+
+static std::string moveToUci(const Move& m)
+{
+    if (m.value == 0xFFFFFFFFu) {
+        return "0000";
+    }
+    std::string out = squareToUci(m.from()) + squareToUci(m.to());
+    if (m.isPromotion()) {
+        char p = 'q';
+        if (m.promotionType() == N) p = 'n';
+        else if (m.promotionType() == B) p = 'b';
+        else if (m.promotionType() == R) p = 'r';
+        out.push_back(p);
+    }
+    return out;
+}
+
+static bool parseUciMove(GameState& gs, const std::string& uci, Move& out)
+{
+    if (uci.size() < 4) return false;
+    const int from = parseSquare(uci.substr(0, 2));
+    const int to = parseSquare(uci.substr(2, 2));
+    if (from < 0 || to < 0) return false;
+
+    int promo = EMPTY;
+    if (uci.size() >= 5) {
+        const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(uci[4])));
+        if (c == 'q') promo = Q;
+        else if (c == 'r') promo = R;
+        else if (c == 'b') promo = B;
+        else if (c == 'n') promo = N;
+    }
+
+    MoveList legal;
+    generateLegalMoves(gs, legal);
+    for (int i = 0; i < legal.count; ++i) {
+        const Move& m = legal.moves[i];
+        if (m.from() != from || m.to() != to) continue;
+        if (!m.isPromotion() && promo == EMPTY) {
+            out = m;
+            return true;
+        }
+        if (m.isPromotion() && promo != EMPTY && m.promotionType() == promo) {
+            out = m;
+            return true;
+        }
+    }
+    return false;
+}
+
+static int computeTimeForGo(const GameState& gs,
+                            int movetime,
+                            int wtime,
+                            int btime,
+                            int winc,
+                            int binc,
+                            int movestogo)
+{
+    if (movetime > 0) {
+        return std::max(50, movetime);
+    }
+
+    const bool white = gs.whiteToMove;
+    const int remain = white ? wtime : btime;
+    const int inc = white ? winc : binc;
+    if (remain <= 0) {
+        return 1000;
+    }
+
+    const int mtg = (movestogo > 0) ? movestogo : 25;
+    int budget = remain / std::max(8, mtg) + inc / 2;
+    budget = std::max(50, budget);
+    budget = std::min(budget, std::max(50, remain - 50));
+    return budget;
+}
+
+static int runUciLoop()
+{
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    GameState gs;
+    gs.initStandard();
+
+    int optionMoveOverheadMs = 30;
+    int optionHashMb = 16;
+    setHashSizeMb(optionHashMb);
+    optionHashMb = getHashSizeMb();
+    int optionThreads = 1;
+    bool optionUseNnue = isUseNnue();
+    std::string optionEvalFile = getNnueEvalFile();
+
+    std::thread searchThread;
+    std::atomic<bool> searchRunning { false };
+    std::mutex ioMutex;
+
+    auto stopAndJoinSearch = [&]() {
+        if (searchRunning.load(std::memory_order_relaxed)) {
+            requestStopSearch();
+        }
+        if (searchThread.joinable()) {
+            searchThread.join();
+        }
+        searchRunning.store(false, std::memory_order_relaxed);
+    };
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+
+        std::istringstream iss(line);
+        std::string cmd;
+        iss >> cmd;
+
+        if (cmd == "uci") {
+            std::cout << "id name Ikshvaku\n";
+            std::cout << "id author Ashish\n";
+            std::cout << "option name Hash type spin default 16 min 1 max 2048\n";
+            std::cout << "option name Threads type spin default 1 min 1 max 1\n";
+            std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
+            std::cout << "option name UseNNUE type check default " << (optionUseNnue ? "true" : "false") << "\n";
+            std::cout << "option name EvalFile type string default " << optionEvalFile << "\n";
+            std::cout << "uciok\n";
+        } else if (cmd == "isready") {
+            if (optionUseNnue) {
+                std::cout << "info string nnue " << (isNnueReady() ? "loaded" : "fallback-classical") << "\n";
+            }
+            std::cout << "readyok\n";
+        } else if (cmd == "ucinewgame") {
+            stopAndJoinSearch();
+            gs.initStandard();
+        } else if (cmd == "position") {
+            stopAndJoinSearch();
+            std::string token;
+            iss >> token;
+            if (token == "startpos") {
+                gs.initStandard();
+                if (iss >> token && token == "moves") {
+                    std::string mv;
+                    while (iss >> mv) {
+                        Move m;
+                        if (parseUciMove(gs, mv, m)) {
+                            makeMove(gs, m);
+                        }
+                    }
+                }
+            } else if (token == "fen") {
+                std::vector<std::string> parts;
+                std::string t;
+                for (int i = 0; i < 6 && iss >> t; ++i) {
+                    parts.push_back(t);
+                }
+                if (parts.size() == 6) {
+                    std::string fen;
+                    for (int i = 0; i < 6; ++i) {
+                        if (i) fen += ' ';
+                        fen += parts[i];
+                    }
+                    gs.loadFromFen(fen);
+                }
+
+                if (iss >> token && token == "moves") {
+                    std::string mv;
+                    while (iss >> mv) {
+                        Move m;
+                        if (parseUciMove(gs, mv, m)) {
+                            makeMove(gs, m);
+                        }
+                    }
+                }
+            }
+        } else if (cmd == "go") {
+            stopAndJoinSearch();
+
+            int movetime = -1;
+            int wtime = -1, btime = -1, winc = 0, binc = 0;
+            int movestogo = -1;
+            int depth = -1;
+            bool infinite = false;
+            bool ponder = false;
+
+            std::string t;
+            while (iss >> t) {
+                if (t == "movetime") iss >> movetime;
+                else if (t == "wtime") iss >> wtime;
+                else if (t == "btime") iss >> btime;
+                else if (t == "winc") iss >> winc;
+                else if (t == "binc") iss >> binc;
+                else if (t == "movestogo") iss >> movestogo;
+                else if (t == "depth") iss >> depth;
+                else if (t == "infinite") infinite = true;
+                else if (t == "ponder") ponder = true;
+                else if (t == "nodes" || t == "mate") {
+                    int ignore = 0;
+                    iss >> ignore;
+                }
+            }
+
+            GameState gsCopy = gs;
+            searchRunning.store(true, std::memory_order_relaxed);
+            clearStopSearch();
+
+            searchThread = std::thread([&, gsCopy, depth, movetime, wtime, btime, winc, binc, movestogo, infinite, ponder, optionMoveOverheadMs]() mutable {
+                int timeMs = 600000;
+                int maxDepth = 64;
+
+                if (depth > 0) {
+                    maxDepth = depth;
+                    if (!infinite && !ponder) {
+                        timeMs = 600000;
+                    }
+                } else if (infinite || ponder) {
+                    timeMs = 600000;
+                } else {
+                    timeMs = computeTimeForGo(gsCopy, movetime, wtime, btime, winc, binc, movestogo);
+                    timeMs = std::max(50, timeMs - optionMoveOverheadMs);
+                }
+
+                Move best = computeBestMove(gsCopy, maxDepth, timeMs);
+
+                {
+                    std::lock_guard<std::mutex> lock(ioMutex);
+                    std::cout << "bestmove " << moveToUci(best) << "\n";
+                    std::cout.flush();
+                }
+                searchRunning.store(false, std::memory_order_relaxed);
+            });
+        } else if (cmd == "stop") {
+            stopAndJoinSearch();
+        } else if (cmd == "setoption") {
+            // Format: setoption name <name> [value <value>]
+            std::vector<std::string> tokens;
+            std::string tok;
+            while (iss >> tok) tokens.push_back(tok);
+
+            size_t namePos = std::find(tokens.begin(), tokens.end(), "name") - tokens.begin();
+            if (namePos >= tokens.size()) {
+                continue;
+            }
+            size_t valuePos = std::find(tokens.begin(), tokens.end(), "value") - tokens.begin();
+
+            std::string name;
+            std::string value;
+            if (valuePos < tokens.size()) {
+                for (size_t i = namePos + 1; i < valuePos; ++i) {
+                    if (!name.empty()) name += ' ';
+                    name += tokens[i];
+                }
+                for (size_t i = valuePos + 1; i < tokens.size(); ++i) {
+                    if (!value.empty()) value += ' ';
+                    value += tokens[i];
+                }
+            } else {
+                for (size_t i = namePos + 1; i < tokens.size(); ++i) {
+                    if (!name.empty()) name += ' ';
+                    name += tokens[i];
+                }
+            }
+
+            auto lower = [](std::string s) {
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                return s;
+            };
+
+            const std::string lname = lower(name);
+            if (lname == "move overhead" && !value.empty()) {
+                optionMoveOverheadMs = std::clamp(std::stoi(value), 0, 5000);
+            } else if (lname == "hash" && !value.empty()) {
+                optionHashMb = std::clamp(std::stoi(value), 1, 2048);
+                setHashSizeMb(optionHashMb);
+                optionHashMb = getHashSizeMb();
+                std::cout << "info string hash " << optionHashMb << " MB\n";
+            } else if (lname == "threads" && !value.empty()) {
+                optionThreads = std::clamp(std::stoi(value), 1, 1);
+                (void)optionThreads;
+            } else if (lname == "usennue") {
+                const std::string lv = lower(value);
+                const bool enabled = (lv == "true" || lv == "1" || lv == "on");
+                optionUseNnue = enabled;
+                setUseNnue(enabled);
+            } else if (lname == "evalfile" && !value.empty()) {
+                optionEvalFile = value;
+                const bool ok = setNnueEvalFile(optionEvalFile);
+                std::cout << "info string nnue-load " << (ok ? "ok" : "failed") << " file " << optionEvalFile << "\n";
+            }
+        } else if (cmd == "ponderhit") {
+            // Ponder is treated as infinite search in this engine; stop/next go controls it.
+        } else if (cmd == "quit") {
+            stopAndJoinSearch();
+            break;
+        }
+
+        std::cout.flush();
+    }
+
+    stopAndJoinSearch();
+    return 0;
+}
 
 struct UIButton {
     sf::RectangleShape rect;
@@ -49,7 +371,14 @@ bool sameMoveFromTo(const Move& a, const Move& b)
 
 int main(int argc, char** argv)
 {
-    if (argc > 1 && std::string(argv[1]) == "--bench") {
+    const std::string defaultNnue = "assets/nn-c288c895ea92.nnue";
+    const bool nnueLoaded = setNnueEvalFile(defaultNnue);
+    setUseNnue(nnueLoaded);
+
+    const std::string modeArg = (argc > 1) ? std::string(argv[1]) : std::string();
+    const bool graphicsMode = (modeArg == "--graphics" || modeArg == "--gui");
+
+    if (!graphicsMode && modeArg == "--bench") {
         int depth = 7;
         int timeLimitMs = 2000;
         if (argc > 2) {
@@ -94,6 +423,11 @@ int main(int argc, char** argv)
                   << "  totalTimeMs " << totalTimeMs
                   << "  totalNps " << static_cast<long long>(totalNps) << "\n";
         return 0;
+    }
+
+    // Default mode is UCI (for compatibility with GUIs that don't pass args).
+    if (!graphicsMode) {
+        return runUciLoop();
     }
 
     GameState gs;
@@ -145,7 +479,7 @@ int main(int argc, char** argv)
     mutex aiMoveMutex;
 
     bool aiEnabled = false, aiPlaysWhite = false;
-    const int aiDepth = 12;
+    const int aiDepth = 14;
     optional<string> gameOverMsg = nullopt;
     optional<pair<int, int>> selectedSquare;
     vector<Move> legalMovesForSelected;

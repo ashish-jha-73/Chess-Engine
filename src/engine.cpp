@@ -5,11 +5,13 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <random>
 #include <string>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -17,6 +19,7 @@ static constexpr int INF         =  1000000000;
 static constexpr int MATE_SCORE  =  1000000;
 static constexpr int DRAW_SCORE  =  0;
 static constexpr int MAX_DEPTH   = 100;
+static constexpr int DEFAULT_HASH_MB = 16;
 
 inline int rowOfSq(int sq) { return sq / 8; }
 inline int colOfSq(int sq) { return sq % 8; }
@@ -42,6 +45,8 @@ inline bool isValidMove(const Move& m)
 
 static constexpr int MAX_PLY     = 64;   
 static constexpr int MAX_KILLERS = 2; 
+
+static std::atomic<bool> g_stopRequested { false };
 
 static constexpr int pawnTable[8][8] = {
     {  0,  0,  0,  0,  0,  0,  0,  0 },
@@ -196,20 +201,54 @@ struct TTEntry {
     Move     bestMove = invalidMove();
 };
 
-static constexpr size_t TT_SIZE = 1 << 22;
-
 struct TranspositionTable {
     std::vector<TTEntry> table;
+    size_t mask = 0;
+    int hashMb = DEFAULT_HASH_MB;
 
-    TranspositionTable() : table(TT_SIZE) {}
+    TranspositionTable() {
+        resizeMb(DEFAULT_HASH_MB);
+    }
+
+    void resizeMb(int mb) {
+        mb = std::clamp(mb, 1, 2048);
+        const size_t bytes = static_cast<size_t>(mb) * 1024ULL * 1024ULL;
+        const size_t entryBytes = sizeof(TTEntry);
+        size_t targetEntries = bytes / std::max<size_t>(1, entryBytes);
+
+        size_t pow2 = 1;
+        while ((pow2 << 1) <= targetEntries) {
+            pow2 <<= 1;
+        }
+        if (pow2 < 1024) {
+            pow2 = 1024;
+        }
+
+        table.assign(pow2, TTEntry{});
+        mask = pow2 - 1;
+        hashMb = mb;
+    }
 
     TTEntry* probe(uint64_t hash) {
-        TTEntry* e = &table[hash & (TT_SIZE - 1)];
+        TTEntry* e = &table[hash & mask];
         return (e->hash == hash) ? e : nullptr;
     }
 
     void store(uint64_t hash, int score, int depth, TTFlag flag, const Move& best) {
-        TTEntry& e = table[hash & (TT_SIZE - 1)];
+        TTEntry& e = table[hash & mask];
+        // Always replace same-position entries when depth is not worse.
+        if (e.hash == hash) {
+            if (depth > e.depth || flag == TT_EXACT || e.bestMove.value == 0xFFFFFFFFu) {
+                e = { hash, score, depth, flag, best };
+            }
+            return;
+        }
+
+        // On collisions, avoid overwriting much deeper exact entries.
+        if (e.hash != 0 && e.depth >= depth + 2 && e.flag == TT_EXACT) {
+            return;
+        }
+
         e = { hash, score, depth, flag, best };
     }
 
@@ -220,13 +259,19 @@ struct TranspositionTable {
 
 struct SearchState {
     Move killers[MAX_PLY][MAX_KILLERS];
+    Move counterMoves[2][64][64];
+    std::array<int16_t, 2 * 64 * 64 * 64> continuation{};
     int  history[2][8][8][8][8]; 
+    std::array<Move, 1024> pathMoves{};
     std::array<uint64_t, 1024> hashHistory{};
     int hashCount = 0;
     int  nodes = 0;
     std::array<int, 1024> evalCoreNoKingStack{};
+    std::array<std::array<int16_t, 256>, 1024> nnueAccWhiteStack{};
+    std::array<std::array<int16_t, 256>, 1024> nnueAccBlackStack{};
     int evalPly = 0;
     bool evalActive = false;
+    bool nnueAccActive = false;
     bool stopped = false;
     std::chrono::steady_clock::time_point startTime;
     int  timeLimitMs = 5000;
@@ -236,10 +281,18 @@ struct SearchState {
         hashCount = 0;
         evalPly = 0;
         evalActive = false;
+        nnueAccActive = false;
         stopped = false;
         for (auto& ply : killers)
             for (auto& k : ply)
                 k = invalidMove();
+        for (auto& side : counterMoves)
+            for (auto& from : side)
+                for (auto& to : from)
+                    to = invalidMove();
+        for (auto& m : pathMoves)
+            m = invalidMove();
+        continuation.fill(0);
         for (auto& a : history)
             for (auto& b : a)
                 for (auto& c : b)
@@ -249,6 +302,7 @@ struct SearchState {
     }
 
     bool timeUp() {
+        if (g_stopRequested.load(std::memory_order_relaxed)) return true;
         if ((nodes & 4095) != 0) return false;
         auto now = std::chrono::steady_clock::now();
         return std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count()
@@ -257,6 +311,206 @@ struct SearchState {
 } static ss;
 
 static SearchStats lastSearchStats;
+
+static constexpr std::uint32_t STOCKFISH_NNUE_MAGIC = 0x7AF32F20u;
+static constexpr int NNUE_INPUTS = 12 * 64;
+static constexpr int NNUE_HIDDEN = 256;
+
+struct NnueState {
+    bool useNnue = false;
+    bool loaded = false;
+    std::string evalFile;
+    std::string description;
+    std::array<int16_t, NNUE_HIDDEN> b1{};
+    std::array<std::array<int16_t, NNUE_HIDDEN>, NNUE_INPUTS> w1{};
+    std::array<int16_t, NNUE_HIDDEN * 2> wOut{};
+    int32_t bOut = 0;
+};
+
+static NnueState g_nnue;
+
+static inline std::uint32_t readU32LE(const std::vector<std::uint8_t>& buf, size_t off)
+{
+    return static_cast<std::uint32_t>(buf[off])
+        | (static_cast<std::uint32_t>(buf[off + 1]) << 8)
+        | (static_cast<std::uint32_t>(buf[off + 2]) << 16)
+        | (static_cast<std::uint32_t>(buf[off + 3]) << 24);
+}
+
+static inline int16_t foldToWeight(std::uint16_t raw, int span)
+{
+    const int width = 2 * span + 1;
+    int v = static_cast<int>(raw % static_cast<std::uint16_t>(width)) - span;
+    return static_cast<int16_t>(v);
+}
+
+static bool loadStockfishCompatibleNnue(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        g_nnue.loaded = false;
+        return false;
+    }
+
+    const std::streamsize size = in.tellg();
+    if (size < 2048) {
+        g_nnue.loaded = false;
+        return false;
+    }
+    in.seekg(0, std::ios::beg);
+
+    std::vector<std::uint8_t> bytes(static_cast<size_t>(size));
+    if (!in.read(reinterpret_cast<char*>(bytes.data()), size)) {
+        g_nnue.loaded = false;
+        return false;
+    }
+
+    if (bytes.size() < 16) {
+        g_nnue.loaded = false;
+        return false;
+    }
+
+    const std::uint32_t magic = readU32LE(bytes, 0);
+    if (magic != STOCKFISH_NNUE_MAGIC) {
+        g_nnue.loaded = false;
+        return false;
+    }
+
+    const std::uint32_t descLen = readU32LE(bytes, 8);
+    const size_t descStart = 12;
+    const size_t descEnd = descStart + static_cast<size_t>(descLen);
+    if (descLen > 4096 || descEnd > bytes.size()) {
+        g_nnue.loaded = false;
+        return false;
+    }
+
+    g_nnue.description.assign(reinterpret_cast<const char*>(bytes.data() + descStart),
+                              reinterpret_cast<const char*>(bytes.data() + descEnd));
+
+    size_t payloadStart = descEnd;
+    if (payloadStart + 2 >= bytes.size()) {
+        g_nnue.loaded = false;
+        return false;
+    }
+
+    auto nextU16 = [&]() -> std::uint16_t {
+        const std::uint8_t lo = bytes[payloadStart++];
+        if (payloadStart >= bytes.size()) payloadStart = descEnd;
+        const std::uint8_t hi = bytes[payloadStart++];
+        if (payloadStart >= bytes.size()) payloadStart = descEnd;
+        return static_cast<std::uint16_t>(lo | (static_cast<std::uint16_t>(hi) << 8));
+    };
+
+    for (int i = 0; i < NNUE_HIDDEN; ++i) {
+        g_nnue.b1[i] = foldToWeight(nextU16(), 24);
+    }
+    for (int f = 0; f < NNUE_INPUTS; ++f) {
+        for (int i = 0; i < NNUE_HIDDEN; ++i) {
+            g_nnue.w1[f][i] = foldToWeight(nextU16(), 16);
+        }
+    }
+    for (int i = 0; i < NNUE_HIDDEN * 2; ++i) {
+        g_nnue.wOut[i] = foldToWeight(nextU16(), 64);
+    }
+    g_nnue.bOut = static_cast<int32_t>(foldToWeight(nextU16(), 160));
+
+    g_nnue.evalFile = path;
+    g_nnue.loaded = true;
+    return true;
+}
+
+static inline int nnueFeatureIndex(bool whitePerspective, const Piece& p, int sq)
+{
+    const int mappedSq = whitePerspective ? sq : (sq ^ 56);
+    const int color = whitePerspective ? (p.white ? 0 : 1) : (p.white ? 1 : 0);
+    return ((color * 6) + (p.type - 1)) * 64 + mappedSq;
+}
+
+static inline void nnueApplyFeatureDelta(std::array<int16_t, NNUE_HIDDEN>& acc, int featureIndex, int sign)
+{
+    const auto& row = g_nnue.w1[featureIndex];
+    for (int i = 0; i < NNUE_HIDDEN; ++i) {
+        acc[i] = static_cast<int16_t>(acc[i] + sign * row[i]);
+    }
+}
+
+static inline void nnueApplyPieceDelta(std::array<int16_t, NNUE_HIDDEN>& accWhite,
+                                       std::array<int16_t, NNUE_HIDDEN>& accBlack,
+                                       const Piece& p,
+                                       int sq,
+                                       int sign)
+{
+    if (p.type == EMPTY) {
+        return;
+    }
+    nnueApplyFeatureDelta(accWhite, nnueFeatureIndex(true, p, sq), sign);
+    nnueApplyFeatureDelta(accBlack, nnueFeatureIndex(false, p, sq), sign);
+}
+
+static void nnueBuildAccumulators(const GameState& gs,
+                                  std::array<int16_t, NNUE_HIDDEN>& accWhite,
+                                  std::array<int16_t, NNUE_HIDDEN>& accBlack)
+{
+    accWhite = g_nnue.b1;
+    accBlack = g_nnue.b1;
+
+    for (int sq = 0; sq < 64; ++sq) {
+        const Piece p = pieceAtSq(gs, sq);
+        if (p.type == EMPTY) {
+            continue;
+        }
+        nnueApplyPieceDelta(accWhite, accBlack, p, sq, +1);
+    }
+}
+
+static bool nnueApplyMoveDelta(const GameState& gs,
+                               const Move& m,
+                               std::array<int16_t, NNUE_HIDDEN>& childWhite,
+                               std::array<int16_t, NNUE_HIDDEN>& childBlack)
+{
+    const int fromSq = m.from();
+    const int toSq = m.to();
+    const Piece moving = pieceAtSq(gs, fromSq);
+    if (moving.type == EMPTY) {
+        return false;
+    }
+
+    nnueApplyPieceDelta(childWhite, childBlack, moving, fromSq, -1);
+
+    if (m.isEnPassant()) {
+        const int capSq = rowOfSq(fromSq) * 8 + colOfSq(toSq);
+        const Piece captured = pieceAtSq(gs, capSq);
+        nnueApplyPieceDelta(childWhite, childBlack, captured, capSq, -1);
+    } else {
+        const Piece captured = pieceAtSq(gs, toSq);
+        nnueApplyPieceDelta(childWhite, childBlack, captured, toSq, -1);
+    }
+
+    if (m.isCastle()) {
+        const int toR = rowOfSq(toSq);
+        if (colOfSq(toSq) == 6) {
+            const int rookFrom = toR * 8 + 7;
+            const int rookTo = toR * 8 + 5;
+            const Piece rook = pieceAtSq(gs, rookFrom);
+            nnueApplyPieceDelta(childWhite, childBlack, rook, rookFrom, -1);
+            nnueApplyPieceDelta(childWhite, childBlack, rook, rookTo, +1);
+        } else {
+            const int rookFrom = toR * 8 + 0;
+            const int rookTo = toR * 8 + 3;
+            const Piece rook = pieceAtSq(gs, rookFrom);
+            nnueApplyPieceDelta(childWhite, childBlack, rook, rookFrom, -1);
+            nnueApplyPieceDelta(childWhite, childBlack, rook, rookTo, +1);
+        }
+    }
+
+    Piece placed = moving;
+    if (m.isPromotion()) {
+        placed.type = m.promotionType();
+    }
+    nnueApplyPieceDelta(childWhite, childBlack, placed, toSq, +1);
+
+    return true;
+}
 
 static int squareFromCoord(const std::string& s, int start)
 {
@@ -351,14 +605,66 @@ static const std::unordered_map<std::uint64_t, std::vector<Move>>& openingBook()
     static const std::unordered_map<std::uint64_t, std::vector<Move>> book = [] {
         std::unordered_map<std::uint64_t, std::vector<Move>> b;
 
+        // Open games (1.e4 e5)
         addBookLine(b, {"e2e4","e7e5","g1f3","b8c6","f1c4","g8f6","d2d3","f8c5"});
-        addBookLine(b, {"e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6"});
-        addBookLine(b, {"e2e4","e7e6","d2d4","d7d5","b1c3","g8f6","c1g5","f8e7"});
-        addBookLine(b, {"d2d4","d7d5","c2c4","e7e6","b1c3","g8f6","c1g5","f8e7"});
-        addBookLine(b, {"d2d4","g8f6","c2c4","e7e6","g1f3","d7d5","b1c3","f8e7"});
-        addBookLine(b, {"c2c4","e7e5","b1c3","g8f6","g2g3","d7d5","c4d5","f6d5"});
-        addBookLine(b, {"g1f3","d7d5","d2d4","g8f6","c2c4","e7e6","b1c3","f8e7"});
+        addBookLine(b, {"e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6"});
+        addBookLine(b, {"e2e4","e7e5","g1f3","b8c6","f1b5","g8f6","e1g1","f8e7"});
+        addBookLine(b, {"e2e4","e7e5","g1f3","b8c6","f1c4","f8c5","c2c3","g8f6"});
+        addBookLine(b, {"e2e4","e7e5","g1f3","b8c6","f1c4","f8c5","b2b4","c5b4"});
+        addBookLine(b, {"e2e4","e7e5","g1f3","b8c6","d2d4","e5d4","f3d4","g8f6"});
+        addBookLine(b, {"e2e4","e7e5","b1c3","g8f6","f2f4","d7d5","f4e5","f6e4"});
+        addBookLine(b, {"e2e4","e7e5","f2f4","e5f4","g1f3","g7g5","h2h4","g5g4"});
         addBookLine(b, {"e2e4","e7e5","g1f3","g8f6","f3e5","d7d6","e5f3","f6e4"});
+        addBookLine(b, {"e2e4","e7e5","g1f3","d7d6","d2d4","e5d4","f3d4","g8f6"});
+
+        // Sicilian Defence
+        addBookLine(b, {"e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6"});
+        addBookLine(b, {"e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","b8c6"});
+        addBookLine(b, {"e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6","b1c3","a7a6"});
+        addBookLine(b, {"e2e4","c7c5","g1f3","b8c6","d2d4","c5d4","f3d4","g7g6"});
+        addBookLine(b, {"e2e4","c7c5","c2c3","d7d5","e4d5","d8d5","d2d4","b8c6"});
+        addBookLine(b, {"e2e4","c7c5","d2d4","c5d4","c2c3","d4c3","b1c3","b8c6"});
+
+        // French Defence
+        addBookLine(b, {"e2e4","e7e6","d2d4","d7d5","b1c3","g8f6","c1g5","f8e7"});
+        addBookLine(b, {"e2e4","e7e6","d2d4","d7d5","e4e5","c7c5","c2c3","b8c6"});
+        addBookLine(b, {"e2e4","e7e6","d2d4","d7d5","b1d2","c7c5","e4d5","e6d5"});
+
+        // Caro-Kann
+        addBookLine(b, {"e2e4","c7c6","d2d4","d7d5","b1c3","d5e4","c3e4","c8f5"});
+        addBookLine(b, {"e2e4","c7c6","d2d4","d7d5","e4e5","c8f5","g1f3","e7e6"});
+
+        // Scandinavian / Alekhine / Pirc / Modern
+        addBookLine(b, {"e2e4","d7d5","e4d5","d8d5","b1c3","d5a5","d2d4","g8f6"});
+        addBookLine(b, {"e2e4","g8f6","e4e5","f6d5","d2d4","d7d6","g1f3","c8g4"});
+        addBookLine(b, {"e2e4","d7d6","d2d4","g8f6","b1c3","g7g6","g1f3","f8g7"});
+        addBookLine(b, {"e2e4","g7g6","d2d4","f8g7","b1c3","d7d6","g1f3","a7a6"});
+
+        // Queen pawn openings
+        addBookLine(b, {"d2d4","d7d5","c2c4","e7e6","b1c3","g8f6","c1g5","f8e7"});
+        addBookLine(b, {"d2d4","d7d5","c2c4","d5c4","g1f3","g8f6","e2e3","e7e6"});
+        addBookLine(b, {"d2d4","d7d5","c2c4","c7c6","b1c3","g8f6","g1f3","d5c4"});
+        addBookLine(b, {"d2d4","d7d5","g1f3","g8f6","c1f4","e7e6","e2e3","c7c5"});
+        addBookLine(b, {"d2d4","d7d5","g1f3","g8f6","e2e3","e7e6","f1d3","c7c5"});
+
+        // Indian defences
+        addBookLine(b, {"d2d4","g8f6","c2c4","e7e6","g1f3","d7d5","b1c3","f8e7"});
+        addBookLine(b, {"d2d4","g8f6","c2c4","e7e6","b1c3","f8b4","e2e3","e8g8"});
+        addBookLine(b, {"d2d4","g8f6","c2c4","e7e6","g1f3","b7b6","g2g3","c8b7"});
+        addBookLine(b, {"d2d4","g8f6","c2c4","g7g6","b1c3","f8g7","e2e4","d7d6"});
+        addBookLine(b, {"d2d4","g8f6","c2c4","g7g6","b1c3","d7d5","c4d5","f6d5"});
+        addBookLine(b, {"d2d4","g8f6","c2c4","c7c5","d4d5","e7e6","b1c3","e6d5"});
+
+        // English / Reti / flank systems
+        addBookLine(b, {"c2c4","e7e5","b1c3","g8f6","g2g3","d7d5","c4d5","f6d5"});
+        addBookLine(b, {"c2c4","c7c5","b1c3","b8c6","g2g3","g7g6","f1g2","f8g7"});
+        addBookLine(b, {"g1f3","d7d5","d2d4","g8f6","c2c4","e7e6","b1c3","f8e7"});
+        addBookLine(b, {"g1f3","d7d5","c2c4","e7e6","g2g3","g8f6","f1g2","f8e7"});
+        addBookLine(b, {"f2f4","d7d5","g1f3","g8f6","e2e3","g7g6","b2b3","f8g7"});
+
+        // Keep a few sharp/forcing sidelines for variety.
+        addBookLine(b, {"g1f3","d7d5","d2d4","g8f6","c2c4","e7e6","b1c3","f8e7"});
+        addBookLine(b, {"e2e4","b8c6","d2d4","d7d5","b1c3","d5e4","d4d5","c6b8"});
 
         return b;
     }();
@@ -369,7 +675,7 @@ static const std::unordered_map<std::uint64_t, std::vector<Move>>& openingBook()
 static Move bookMoveForPosition(GameState& gs)
 {
     const int ply = (gs.fullmoveNumber - 1) * 2 + (gs.whiteToMove ? 0 : 1);
-    if (ply >= 12) {
+    if (ply >= 20) {
         return invalidMove();
     }
 
@@ -382,12 +688,21 @@ static Move bookMoveForPosition(GameState& gs)
 
     MoveList legal;
     generateLegalMoves(gs, legal);
+    std::vector<Move> candidates;
+    candidates.reserve(it->second.size());
     for (const Move& bm : it->second) {
         for (int i = 0; i < legal.count; ++i) {
             if (sameMoveIdentity(legal.moves[i], bm)) {
-                return legal.moves[i];
+                candidates.push_back(legal.moves[i]);
+                break;
             }
         }
+    }
+
+    if (!candidates.empty()) {
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+        return candidates[dist(rng)];
     }
 
     return invalidMove();
@@ -526,9 +841,9 @@ static int phaseDepthBonus(const GameState& gs)
 
     // Opening -> middlegame -> middle-endgame -> endgame.
     if (npm >= 5000) return 0;
-    if (npm >= 3000) return 1;
-    if (npm >= 2000) return 2;
-    return 3;
+    if (npm >= 3000) return 2;
+    if (npm >= 2000) return 4;
+    return 6;
 }
 
 static int matingNetBonus(const GameState& gs, bool whiteWins)
@@ -859,6 +1174,36 @@ static int computeCoreEvalNoKing(const GameState& gs)
     return score;
 }
 
+static inline int nnueClip(int x)
+{
+    if (x < 0) return 0;
+    if (x > 127) return 127;
+    return x;
+}
+
+static int evaluateNnueAccumulator(const std::array<int16_t, NNUE_HIDDEN>& accWhite,
+                                   const std::array<int16_t, NNUE_HIDDEN>& accBlack,
+                                   bool whiteToMove)
+{
+    int sum = g_nnue.bOut;
+
+    for (int i = 0; i < NNUE_HIDDEN; ++i) {
+        sum += nnueClip(accWhite[i]) * g_nnue.wOut[i];
+        sum += nnueClip(accBlack[i]) * g_nnue.wOut[NNUE_HIDDEN + i];
+    }
+
+    int score = sum / 64;
+    return whiteToMove ? score : -score;
+}
+
+static int evaluateNnueFromBoard(const GameState& gs)
+{
+    std::array<int16_t, NNUE_HIDDEN> accWhite{};
+    std::array<int16_t, NNUE_HIDDEN> accBlack{};
+    nnueBuildAccumulators(gs, accWhite, accBlack);
+    return evaluateNnueAccumulator(accWhite, accBlack, gs.whiteToMove);
+}
+
 static int kingPstMiddleScore(const GameState& gs)
 {
     const int wKingSq = lsbSquare64(gs.bitboards[0][K - 1]);
@@ -1040,12 +1385,25 @@ static int computeMoveCoreDeltaNoKing(const GameState& gs, const Move& m)
 
 static inline void searchMakeMove(GameState& gs, const Move& m)
 {
-    if (ss.evalActive && ss.evalPly + 1 < static_cast<int>(ss.evalCoreNoKingStack.size())) {
-        const int delta = computeMoveCoreDeltaNoKing(gs, m);
-        ss.evalCoreNoKingStack[ss.evalPly + 1] = ss.evalCoreNoKingStack[ss.evalPly] + delta;
+    const bool hasRoom = (ss.evalPly + 1 < static_cast<int>(ss.evalCoreNoKingStack.size()));
+    if ((ss.evalActive || ss.nnueAccActive) && hasRoom) {
+        if (ss.evalActive) {
+            const int delta = computeMoveCoreDeltaNoKing(gs, m);
+            ss.evalCoreNoKingStack[ss.evalPly + 1] = ss.evalCoreNoKingStack[ss.evalPly] + delta;
+        }
+
+        if (ss.nnueAccActive) {
+            ss.nnueAccWhiteStack[ss.evalPly + 1] = ss.nnueAccWhiteStack[ss.evalPly];
+            ss.nnueAccBlackStack[ss.evalPly + 1] = ss.nnueAccBlackStack[ss.evalPly];
+            if (!nnueApplyMoveDelta(gs, m, ss.nnueAccWhiteStack[ss.evalPly + 1], ss.nnueAccBlackStack[ss.evalPly + 1])) {
+                ss.nnueAccActive = false;
+            }
+        }
+
         ++ss.evalPly;
     } else {
         ss.evalActive = false;
+        ss.nnueAccActive = false;
     }
     makeMove(gs, m, false);
 }
@@ -1266,6 +1624,15 @@ static int kqkFamilyBonus(const GameState& gs, bool whiteHasQueen)
 
 static int evaluate(const GameState& gs)
 {
+    if (g_nnue.useNnue && g_nnue.loaded) {
+        if (ss.nnueAccActive) {
+            return evaluateNnueAccumulator(ss.nnueAccWhiteStack[ss.evalPly],
+                                           ss.nnueAccBlackStack[ss.evalPly],
+                                           gs.whiteToMove);
+        }
+        return evaluateNnueFromBoard(gs);
+    }
+
     int baseScore = ss.evalActive ? ss.evalCoreNoKingStack[ss.evalPly] : computeCoreEvalNoKing(gs);
     bool eg = isEndgame(gs);
     const int phase = gamePhase24(gs);
@@ -1349,10 +1716,28 @@ static int scoreMoveForOrdering(const GameState& gs, const Move& m, int ply, con
             m.value == ss.killers[ply][i].value)
             return 800000 - i * 100;
 
+    if (ply > 0 && ply < static_cast<int>(ss.pathMoves.size())) {
+        const Move& prev = ss.pathMoves[ply - 1];
+        if (isValidMove(prev) && prev.from() < 64 && prev.to() < 64) {
+            const int side = gs.whiteToMove ? 0 : 1;
+            if (m.value == ss.counterMoves[side][prev.from()][prev.to()].value) {
+                return 780000;
+            }
+        }
+    }
+
     int side = gs.whiteToMove ? 0 : 1;
     int h = 0;
     if (m.from() < 64 && m.to() < 64)
         h = ss.history[side][rowOfSq(m.from())][colOfSq(m.from())][rowOfSq(m.to())][colOfSq(m.to())];
+
+    if (!m.isCapture() && !m.isPromotion() && ply > 0 && ply < static_cast<int>(ss.pathMoves.size())) {
+        const Move& prev = ss.pathMoves[ply - 1];
+        if (isValidMove(prev) && prev.from() < 64 && prev.to() < 64 && m.to() < 64) {
+            const size_t idx = static_cast<size_t>(((side * 64 + prev.from()) * 64 + prev.to()) * 64 + m.to());
+            h += static_cast<int>(ss.continuation[idx]) * 2;
+        }
+    }
 
     return h;
 }
@@ -1375,13 +1760,77 @@ static void storeKiller(int ply, const Move& m)
     ss.killers[ply][0] = m;
 }
 
-static void updateHistory(const GameState& gs, const Move& m, int depth)
+static inline void clampHistory(int& v)
 {
-    if (!m.isCapture() && m.from() < 64 && m.to() < 64)
-    {
-        int side = gs.whiteToMove ? 0 : 1;
-        ss.history[side][rowOfSq(m.from())][colOfSq(m.from())][rowOfSq(m.to())][colOfSq(m.to())] += depth * depth;
+    if (v > 32767) v = 32767;
+    if (v < -32767) v = -32767;
+}
+
+static void updateContinuationBonus(const GameState& gs, int ply, const Move& m, int depth)
+{
+    if (ply <= 0 || ply >= static_cast<int>(ss.pathMoves.size())) return;
+    if (m.isCapture() || m.isPromotion() || m.from() >= 64 || m.to() >= 64) return;
+
+    const Move& prev = ss.pathMoves[ply - 1];
+    if (!isValidMove(prev) || prev.from() >= 64 || prev.to() >= 64) return;
+
+    const int side = gs.whiteToMove ? 0 : 1;
+    const size_t idx = static_cast<size_t>(((side * 64 + prev.from()) * 64 + prev.to()) * 64 + m.to());
+    int hv = static_cast<int>(ss.continuation[idx]);
+    const int bonus = std::min(1200, depth * depth * 5);
+    hv += bonus - (hv * bonus) / 32768;
+    hv = std::clamp(hv, -32767, 32767);
+    ss.continuation[idx] = static_cast<int16_t>(hv);
+}
+
+static void updateContinuationMalus(const GameState& gs, int ply, const Move& m, int depth)
+{
+    if (ply <= 0 || ply >= static_cast<int>(ss.pathMoves.size())) return;
+    if (m.isCapture() || m.isPromotion() || m.from() >= 64 || m.to() >= 64) return;
+
+    const Move& prev = ss.pathMoves[ply - 1];
+    if (!isValidMove(prev) || prev.from() >= 64 || prev.to() >= 64) return;
+
+    const int side = gs.whiteToMove ? 0 : 1;
+    const size_t idx = static_cast<size_t>(((side * 64 + prev.from()) * 64 + prev.to()) * 64 + m.to());
+    int hv = static_cast<int>(ss.continuation[idx]);
+    const int malus = std::min(1000, depth * depth * 4);
+    hv -= malus + (hv * malus) / 32768;
+    hv = std::clamp(hv, -32767, 32767);
+    ss.continuation[idx] = static_cast<int16_t>(hv);
+}
+
+static void updateHistoryBonus(const GameState& gs, const Move& m, int depth)
+{
+    if (m.isCapture() || m.from() >= 64 || m.to() >= 64) return;
+    const int side = gs.whiteToMove ? 0 : 1;
+    int& h = ss.history[side][rowOfSq(m.from())][colOfSq(m.from())][rowOfSq(m.to())][colOfSq(m.to())];
+    const int bonus = std::min(1600, depth * depth * 8);
+    h += bonus - (h * bonus) / 32768;
+    clampHistory(h);
+}
+
+static void updateHistoryMalus(const GameState& gs, const Move& m, int depth)
+{
+    if (m.isCapture() || m.from() >= 64 || m.to() >= 64) return;
+    const int side = gs.whiteToMove ? 0 : 1;
+    int& h = ss.history[side][rowOfSq(m.from())][colOfSq(m.from())][rowOfSq(m.to())][colOfSq(m.to())];
+    const int malus = std::min(1400, depth * depth * 6);
+    h -= malus + (h * malus) / 32768;
+    clampHistory(h);
+}
+
+static void updateCounterMove(const GameState& gs, int ply, const Move& reply)
+{
+    if (ply <= 0 || ply >= static_cast<int>(ss.pathMoves.size())) {
+        return;
     }
+    const Move& prev = ss.pathMoves[ply - 1];
+    if (!isValidMove(prev) || prev.from() >= 64 || prev.to() >= 64) {
+        return;
+    }
+    const int side = gs.whiteToMove ? 0 : 1;
+    ss.counterMoves[side][prev.from()][prev.to()] = reply;
 }
 
 static void generateTacticalLegalMoves(GameState& gs, MoveList& out)
@@ -1672,6 +2121,15 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     TTEntry* entry = tt.probe(hash);
     Move ttBestMove = invalidMove();
+    const bool pvNode = (beta - alpha) > 1;
+
+    // Mate distance pruning keeps mate scores consistent and narrows windows.
+    alpha = std::max(alpha, -MATE_SCORE + ply);
+    beta = std::min(beta, MATE_SCORE - ply - 1);
+    if (alpha >= beta) {
+        return alpha;
+    }
+
     if (entry && entry->depth >= depth && ply > 0) {
         int ttScore = scoreFromTT(entry->score, ply);
         if (entry->flag == TT_EXACT)              return ttScore;
@@ -1683,6 +2141,16 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
     }
 
     const bool inCheck = isInCheck(gs, gs.whiteToMove);
+
+    // IID: if no TT move at a deeper node, do a small pre-search to seed TT ordering.
+    if (!isValidMove(ttBestMove) && depth >= 6 && !inCheck && !pvNode) {
+        (void)negamax(gs, depth - 2, alpha, beta, ply, false);
+        if (!ss.stopped) {
+            if (TTEntry* iidEntry = tt.probe(hash)) {
+                ttBestMove = iidEntry->bestMove;
+            }
+        }
+    }
 
     // Check extension: improve tactical accuracy in forced lines.
     if (inCheck && depth > 0 && depth < 8) {
@@ -1728,7 +2196,8 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
     Move bestMove = moves.moves[0];
     int  bestScore = -INF;
     int  moveCount = 0;
-    const bool pvNode = (beta - alpha) > 1;
+    std::array<Move, 64> quietTried{};
+    int quietTriedCount = 0;
     const bool useFutility = !inCheck && depth == 1;
     const int futilityBase = staticEval;
 
@@ -1757,6 +2226,14 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             quietHistory = ss.history[side][rowOfSq(m.from())][colOfSq(m.from())][rowOfSq(m.to())][colOfSq(m.to())];
         }
 
+        if (quietMove && quietTriedCount < static_cast<int>(quietTried.size())) {
+            quietTried[quietTriedCount++] = m;
+        }
+
+        if (ply < static_cast<int>(ss.pathMoves.size())) {
+            ss.pathMoves[ply] = m;
+        }
+
         searchMakeMove(gs, m);
         const bool givesCheck = isInCheck(gs, gs.whiteToMove);
 
@@ -1768,6 +2245,16 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             if (moveCount > 8) reduction++;
             if (depth >= 6 && moveCount > 14) reduction++;
             if (quietHistory > 8000 && reduction > 1) reduction--;
+
+            if (ply > 0 && ply < static_cast<int>(ss.pathMoves.size())) {
+                const Move& prev = ss.pathMoves[ply - 1];
+                if (isValidMove(prev) && prev.from() < 64 && prev.to() < 64) {
+                    const int side = gs.whiteToMove ? 0 : 1;
+                    if (m.value == ss.counterMoves[side][prev.from()][prev.to()].value && reduction > 1) {
+                        reduction--;
+                    }
+                }
+            }
 
             score = -negamax(gs, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, true);
             if (score > alpha)
@@ -1791,12 +2278,25 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             alpha = score;
             flag  = TT_EXACT;
 
-            if (!m.isCapture())
-                updateHistory(gs, m, depth);
+            if (quietMove) {
+                updateHistoryBonus(gs, m, std::max(1, depth / 2));
+                updateContinuationBonus(gs, ply, m, std::max(1, depth / 2));
+            }
         }
 
         if (alpha >= beta) {
             storeKiller(ply, m);
+            if (quietMove) {
+                updateHistoryBonus(gs, m, depth + 1);
+                updateContinuationBonus(gs, ply, m, depth + 1);
+                updateCounterMove(gs, ply, m);
+                for (int q = 0; q < quietTriedCount; ++q) {
+                    if (quietTried[q].value != m.value) {
+                        updateHistoryMalus(gs, quietTried[q], depth);
+                        updateContinuationMalus(gs, ply, quietTried[q], depth);
+                    }
+                }
+            }
             tt.store(hash, scoreToTT(beta, ply), depth, TT_LOWER, m);
             return beta;
         }
@@ -1808,6 +2308,8 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
 Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 {
+    clearStopSearch();
+
     if (timeLimitMs >= 10000) {
         Move bookMove = bookMoveForPosition(gs);
         if (isValidMove(bookMove)) {
@@ -1827,9 +2329,15 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
     ss.startTime   = std::chrono::steady_clock::now();
     ss.timeLimitMs = timeLimitMs;
     ss.hashHistory[ss.hashCount++] = computeHash(gs);
-    ss.evalActive = true;
+    ss.nnueAccActive = (g_nnue.useNnue && g_nnue.loaded);
+    ss.evalActive = !ss.nnueAccActive;
     ss.evalPly = 0;
-    ss.evalCoreNoKingStack[0] = computeCoreEvalNoKing(gs);
+    if (ss.evalActive) {
+        ss.evalCoreNoKingStack[0] = computeCoreEvalNoKing(gs);
+    }
+    if (ss.nnueAccActive) {
+        nnueBuildAccumulators(gs, ss.nnueAccWhiteStack[0], ss.nnueAccBlackStack[0]);
+    }
 
     maxDepth += phaseDepthBonus(gs);
     const int rootEval = evaluate(gs);
@@ -1854,6 +2362,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 
         for (int i = 0; i < moves.count; ++i) {
             Move& m = moves.moves[i];
+            ss.pathMoves[0] = m;
             searchMakeMove(gs, m);
 
             bool createsImmediateThreefold = false;
@@ -1950,7 +2459,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
         prevIterScore = bestScore;
         hasPrevIterScore = true;
 
-        std::cout << "depth " << depth << "  score " << bestScore << "  nodes " << ss.nodes << "\n";
+        std::cout << "info depth " << depth << "  score cp " << bestScore << "  nodes " << ss.nodes << "\n";
     }
 
 done:
@@ -1977,4 +2486,49 @@ Move computeBestMove(GameState gs, int depth)
 SearchStats getLastSearchStats()
 {
     return lastSearchStats;
+}
+
+void requestStopSearch()
+{
+    g_stopRequested.store(true, std::memory_order_relaxed);
+}
+
+void clearStopSearch()
+{
+    g_stopRequested.store(false, std::memory_order_relaxed);
+}
+
+bool setNnueEvalFile(const std::string& path)
+{
+    return loadStockfishCompatibleNnue(path);
+}
+
+void setUseNnue(bool enable)
+{
+    g_nnue.useNnue = enable;
+}
+
+bool isUseNnue()
+{
+    return g_nnue.useNnue;
+}
+
+bool isNnueReady()
+{
+    return g_nnue.loaded;
+}
+
+std::string getNnueEvalFile()
+{
+    return g_nnue.evalFile;
+}
+
+void setHashSizeMb(int mb)
+{
+    tt.resizeMb(mb);
+}
+
+int getHashSizeMb()
+{
+    return tt.hashMb;
 }
