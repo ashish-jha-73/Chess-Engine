@@ -12,6 +12,8 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <random>
+#include <cctype>
 
 #include "../include/chess.hpp"
 #include "../include/engine.hpp"
@@ -95,24 +97,252 @@ static int computeTimeForGo(const GameState& gs,
                             int btime,
                             int winc,
                             int binc,
-                            int movestogo)
+                            int movestogo,
+                            int slowMoverPct,
+                            int minThinkMs)
 {
     if (movetime > 0) {
-        return std::max(50, movetime);
+        return std::max(minThinkMs, movetime);
     }
 
     const bool white = gs.whiteToMove;
     const int remain = white ? wtime : btime;
     const int inc = white ? winc : binc;
     if (remain <= 0) {
-        return 1000;
+        return std::max(100, minThinkMs);
     }
 
-    const int mtg = (movestogo > 0) ? movestogo : 25;
-    int budget = remain / std::max(8, mtg) + inc / 2;
-    budget = std::max(50, budget);
-    budget = std::min(budget, std::max(50, remain - 50));
+    int mtg = movestogo;
+    if (mtg <= 0) {
+        if (remain > 180000) mtg = 34;
+        else if (remain > 90000) mtg = 28;
+        else mtg = 22;
+    }
+
+    int budget = remain / std::max(10, mtg);
+    budget += (movestogo > 0) ? (inc / 2) : ((inc * 7) / 10);
+    budget = (budget * std::clamp(slowMoverPct, 50, 400)) / 100;
+
+    const int reserve = std::max(100, remain / 30);
+    const int hardCap = std::max(minThinkMs, remain - reserve);
+    const int softCap = std::max(minThinkMs, remain / 8 + inc);
+
+    budget = std::max(minThinkMs, budget);
+    budget = std::min(budget, softCap);
+    budget = std::min(budget, hardCap);
     return budget;
+}
+
+static int parseIntOrDefault(const std::string& s, int fallback)
+{
+    try {
+        size_t idx = 0;
+        const int v = std::stoi(s, &idx);
+        if (idx != s.size()) {
+            return fallback;
+        }
+        return v;
+    } catch (...) {
+        return fallback;
+    }
+}
+
+static bool parseBoolOrDefault(const std::string& s, bool fallback)
+{
+    std::string v = s;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (v == "true" || v == "on" || v == "1" || v == "yes") return true;
+    if (v == "false" || v == "off" || v == "0" || v == "no") return false;
+    return fallback;
+}
+
+static double parseOutcomeScore(const std::string& gameOverMsg, bool candidateWasWhite)
+{
+    std::string s = gameOverMsg;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (s.find("draw") != std::string::npos || s.find("stalemate") != std::string::npos) {
+        return 0.5;
+    }
+    if (s.find("white wins") != std::string::npos) {
+        return candidateWasWhite ? 1.0 : 0.0;
+    }
+    if (s.find("black wins") != std::string::npos) {
+        return candidateWasWhite ? 0.0 : 1.0;
+    }
+    return 0.5;
+}
+
+struct SprtState {
+    int games = 0;
+    int wins = 0;
+    int draws = 0;
+    int losses = 0;
+    double llr = 0.0;
+};
+
+static void sprtUpdate(SprtState& s, double score, double elo0, double elo1, double alpha, double beta)
+{
+    if (score > 0.75) s.wins++;
+    else if (score < 0.25) s.losses++;
+    else s.draws++;
+    s.games++;
+
+    const double drawRate = (s.games > 0) ? static_cast<double>(s.draws) / static_cast<double>(s.games) : 0.4;
+
+    auto expectedScore = [](double elo) {
+        return 1.0 / (1.0 + std::pow(10.0, -elo / 400.0));
+    };
+
+    const double e0 = expectedScore(elo0);
+    const double e1 = expectedScore(elo1);
+
+    auto probs = [&](double e) {
+        const double d = std::clamp(drawRate, 0.05, 0.95);
+        double w = e - 0.5 * d;
+        w = std::clamp(w, 1e-6, 1.0 - d - 1e-6);
+        double l = 1.0 - d - w;
+        l = std::max(l, 1e-6);
+        return std::array<double, 3> { w, d, l };
+    };
+
+    const auto p0 = probs(e0);
+    const auto p1 = probs(e1);
+    int idx = 1;
+    if (score > 0.75) idx = 0;
+    else if (score < 0.25) idx = 2;
+
+    s.llr += std::log(p1[idx] / p0[idx]);
+
+    const double A = std::log((1.0 - beta) / alpha);
+    const double B = std::log(beta / (1.0 - alpha));
+    (void)A;
+    (void)B;
+}
+
+static int runTuneLoop(int maxGames, int moveTimeMs)
+{
+    std::vector<std::string> tuneFens = {
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bq1rk1/ppp2ppp/2np1n2/3Np3/2B1P3/5N2/PPP2PPP/R1BQ1RK1 w - - 0 8",
+        "8/2p5/3p4/1p1P4/1P3k2/2P2P2/6K1/8 w - - 0 40",
+        "2r2rk1/1bq1bppp/p2ppn2/1pn5/3NP3/1BN1BP2/PPQ2P1P/2RR2K1 w - - 0 14",
+        "r4rk1/1pp1qppp/p1np1n2/4p3/2B1P3/2NP1N2/PPP2PPP/R1BQR1K1 w - - 2 11"
+    };
+
+    std::mt19937 rng(std::random_device{}());
+    EngineTuningParams best = getTuningParams();
+
+    auto mutate = [&](const EngineTuningParams& b) {
+        EngineTuningParams c = b;
+        std::uniform_int_distribution<int> dSmall(-12, 12);
+        std::uniform_int_distribution<int> dMed(-20, 20);
+
+        c.futilityBaseMargin += dMed(rng);
+        c.futilityDepthMargin += dSmall(rng);
+        c.lmpBaseMargin += dMed(rng);
+        c.lmpDepthMargin += dSmall(rng);
+        c.qsearchDeltaMargin += dMed(rng);
+        c.qsearchSeeThreshold += dMed(rng);
+        c.singularBaseMargin += dSmall(rng);
+        c.singularDepthMargin += dSmall(rng) / 2;
+        c.nnueMgWeight += dSmall(rng);
+        c.nnueEgWeight += dSmall(rng);
+        c.nullVerifyMinDepth += dSmall(rng) / 8;
+
+        setTuningParams(c);
+        return getTuningParams();
+    };
+
+    const double alpha = 0.05;
+    const double beta = 0.05;
+    const double elo0 = 0.0;
+    const double elo1 = 10.0;
+    const double A = std::log((1.0 - beta) / alpha);
+    const double B = std::log(beta / (1.0 - alpha));
+
+    const int maxTotalGames = std::max(1, maxGames);
+    int totalGamesPlayed = 0;
+    int iteration = 0;
+    const bool prevInfoOutput = isSearchInfoOutputEnabled();
+    setSearchInfoOutputEnabled(false);
+
+    while (iteration < 24 && totalGamesPlayed < maxTotalGames) {
+        iteration++;
+        EngineTuningParams cand = mutate(best);
+        SprtState s {};
+
+        const int gamesThisCandidate = std::min(8, maxTotalGames - totalGamesPlayed);
+
+        for (int g = 0; g < gamesThisCandidate; ++g) {
+            GameState gs;
+            gs.loadFromFen(tuneFens[static_cast<size_t>(g) % tuneFens.size()]);
+
+            const bool candidateWhite = (g % 2 == 0);
+            bool done = false;
+
+            for (int ply = 0; ply < 220; ++ply) {
+                setTuningParams(gs.whiteToMove == candidateWhite ? cand : best);
+
+                Move mv = computeBestMove(gs, 8, moveTimeMs);
+                if (mv.value == 0xFFFFFFFFu) {
+                    done = true;
+                    sprtUpdate(s, 0.5, elo0, elo1, alpha, beta);
+                    break;
+                }
+                makeMove(gs, mv);
+
+                auto over = checkGameOver(gs);
+                if (over.has_value()) {
+                    const double score = parseOutcomeScore(*over, candidateWhite);
+                    sprtUpdate(s, score, elo0, elo1, alpha, beta);
+                    done = true;
+                    break;
+                }
+            }
+
+            if (!done) {
+                sprtUpdate(s, 0.5, elo0, elo1, alpha, beta);
+            }
+
+            totalGamesPlayed++;
+
+            std::cout << "tune iter " << iteration
+                      << " game " << s.games
+                      << " total " << totalGamesPlayed << "/" << maxTotalGames
+                      << " w/d/l " << s.wins << "/" << s.draws << "/" << s.losses
+                      << " llr " << s.llr << "\n";
+
+            if (s.llr >= A) {
+                best = cand;
+                std::cout << "tune accept candidate at iter " << iteration << "\n";
+                break;
+            }
+            if (s.llr <= B) {
+                std::cout << "tune reject candidate at iter " << iteration << "\n";
+                break;
+            }
+        }
+    }
+
+    setTuningParams(best);
+    setSearchInfoOutputEnabled(prevInfoOutput);
+    std::cout << "tune final params"
+              << " futBase=" << best.futilityBaseMargin
+              << " futDepth=" << best.futilityDepthMargin
+              << " lmpBase=" << best.lmpBaseMargin
+              << " lmpDepth=" << best.lmpDepthMargin
+              << " qDelta=" << best.qsearchDeltaMargin
+              << " qSee=" << best.qsearchSeeThreshold
+              << " singBase=" << best.singularBaseMargin
+              << " singDepth=" << best.singularDepthMargin
+              << " nnueMg=" << best.nnueMgWeight
+              << " nnueEg=" << best.nnueEgWeight
+              << " nullVerify=" << best.nullVerifyMinDepth
+              << "\n";
+
+    return 0;
 }
 
 static int runUciLoop()
@@ -122,11 +352,22 @@ static int runUciLoop()
 
     GameState gs;
     gs.initStandard();
+    learningStartGame();
 
-    int optionMoveOverheadMs = 30;
-    int optionHashMb = 16;
+    int optionMoveOverheadMs = 50;
+    int optionMinThinkTimeMs = 80;
+    int optionSlowMoverPct = 125;
+    bool optionExperienceLearning = true;
+    bool optionVerboseInfo = false;
+    int optionHashMb = 256;
+    std::string optionSyzygyPath;
+    int optionSyzygyProbeLimit = 6;
     setHashSizeMb(optionHashMb);
     optionHashMb = getHashSizeMb();
+    setExperienceLearningEnabled(optionExperienceLearning);
+    setSearchInfoOutputEnabled(optionVerboseInfo);
+    setSyzygyPath(optionSyzygyPath);
+    setSyzygyProbeLimit(optionSyzygyProbeLimit);
     int optionThreads = 1;
 
     std::thread searchThread;
@@ -154,15 +395,23 @@ static int runUciLoop()
         if (cmd == "uci") {
             std::cout << "id name Ikshvaku\n";
             std::cout << "id author Ashish\n";
-            std::cout << "option name Hash type spin default 16 min 1 max 2048\n";
+            std::cout << "option name Hash type spin default 256 min 1 max 2048\n";
             std::cout << "option name Threads type spin default 1 min 1 max 1\n";
-            std::cout << "option name Move Overhead type spin default 30 min 0 max 5000\n";
+            std::cout << "option name Move Overhead type spin default 50 min 0 max 5000\n";
+            std::cout << "option name Min Think Time type spin default 80 min 0 max 5000\n";
+            std::cout << "option name Slow Mover type spin default 125 min 50 max 400\n";
+            std::cout << "option name Verbose Info type check default false\n";
+            std::cout << "option name Experience Learning type check default true\n";
+            std::cout << "option name SyzygyPath type string default \n";
+            std::cout << "option name SyzygyProbeLimit type spin default 6 min 3 max 7\n";
             std::cout << "uciok\n";
         } else if (cmd == "isready") {
             std::cout << "readyok\n";
         } else if (cmd == "ucinewgame") {
             stopAndJoinSearch();
+            learningAbortGame();
             gs.initStandard();
+            learningStartGame();
         } else if (cmd == "position") {
             stopAndJoinSearch();
             std::string token;
@@ -203,6 +452,10 @@ static int runUciLoop()
                     }
                 }
             }
+
+            if (checkGameOver(gs).has_value()) {
+                learningFinalizeGame();
+            }
         } else if (cmd == "go") {
             stopAndJoinSearch();
 
@@ -234,7 +487,7 @@ static int runUciLoop()
             searchRunning.store(true, std::memory_order_relaxed);
             clearStopSearch();
 
-            searchThread = std::thread([&, gsCopy, depth, movetime, wtime, btime, winc, binc, movestogo, infinite, ponder, optionMoveOverheadMs]() mutable {
+            searchThread = std::thread([&, gsCopy, depth, movetime, wtime, btime, winc, binc, movestogo, infinite, ponder, optionMoveOverheadMs, optionMinThinkTimeMs, optionSlowMoverPct]() mutable {
                 int timeMs = 600000;
                 int maxDepth = 64;
 
@@ -246,8 +499,40 @@ static int runUciLoop()
                 } else if (infinite || ponder) {
                     timeMs = 600000;
                 } else {
-                    timeMs = computeTimeForGo(gsCopy, movetime, wtime, btime, winc, binc, movestogo);
-                    timeMs = std::max(50, timeMs - optionMoveOverheadMs);
+                    const bool sideToMoveWhite = gsCopy.whiteToMove;
+                    const int remain = sideToMoveWhite ? wtime : btime;
+
+                    const int adaptiveMinThink =
+                        (remain > 0)
+                            ? std::clamp(remain / 20, 15, optionMinThinkTimeMs)
+                            : optionMinThinkTimeMs;
+
+                    timeMs = computeTimeForGo(gsCopy,
+                                              movetime,
+                                              wtime,
+                                              btime,
+                                              winc,
+                                              binc,
+                                              movestogo,
+                                              optionSlowMoverPct,
+                                              adaptiveMinThink);
+                    timeMs = std::max(adaptiveMinThink, timeMs - optionMoveOverheadMs);
+
+                    // Hard anti-flag cap: always keep reserve for transport/UI jitter and future moves.
+                    if (remain > 0) {
+                        int reserve = std::max(80, optionMoveOverheadMs * 3);
+                        if (remain < 1000) {
+                            reserve = std::max(reserve, remain / 3);
+                        } else if (remain < 3000) {
+                            reserve = std::max(reserve, remain / 4);
+                        } else {
+                            reserve = std::max(reserve, remain / 10);
+                        }
+
+                        const int hardCap = std::max(15, remain - reserve);
+                        timeMs = std::min(timeMs, hardCap);
+                        timeMs = std::max(15, timeMs);
+                    }
                 }
 
                 Move best = computeBestMove(gsCopy, maxDepth, timeMs);
@@ -300,20 +585,41 @@ static int runUciLoop()
 
             const std::string lname = lower(name);
             if (lname == "move overhead" && !value.empty()) {
-                optionMoveOverheadMs = std::clamp(std::stoi(value), 0, 5000);
+                optionMoveOverheadMs = std::clamp(parseIntOrDefault(value, optionMoveOverheadMs), 0, 5000);
+            } else if (lname == "min think time" && !value.empty()) {
+                optionMinThinkTimeMs = std::clamp(parseIntOrDefault(value, optionMinThinkTimeMs), 0, 5000);
+            } else if (lname == "slow mover" && !value.empty()) {
+                optionSlowMoverPct = std::clamp(parseIntOrDefault(value, optionSlowMoverPct), 50, 400);
             } else if (lname == "hash" && !value.empty()) {
-                optionHashMb = std::clamp(std::stoi(value), 1, 2048);
+                optionHashMb = std::clamp(parseIntOrDefault(value, optionHashMb), 1, 2048);
                 setHashSizeMb(optionHashMb);
                 optionHashMb = getHashSizeMb();
                 std::cout << "info string hash " << optionHashMb << " MB\n";
+            } else if (lname == "experience learning") {
+                optionExperienceLearning = parseBoolOrDefault(value, optionExperienceLearning);
+                setExperienceLearningEnabled(optionExperienceLearning);
+                std::cout << "info string experience_learning " << (optionExperienceLearning ? "on" : "off") << "\n";
+            } else if (lname == "verbose info") {
+                optionVerboseInfo = parseBoolOrDefault(value, optionVerboseInfo);
+                setSearchInfoOutputEnabled(optionVerboseInfo);
+                std::cout << "info string verbose_info " << (optionVerboseInfo ? "on" : "off") << "\n";
+            } else if (lname == "syzygypath") {
+                optionSyzygyPath = value;
+                setSyzygyPath(optionSyzygyPath);
+                std::cout << "info string syzygypath " << (optionSyzygyPath.empty() ? "<empty>" : optionSyzygyPath) << "\n";
+            } else if (lname == "syzygyprobelimit" && !value.empty()) {
+                optionSyzygyProbeLimit = std::clamp(parseIntOrDefault(value, optionSyzygyProbeLimit), 3, 7);
+                setSyzygyProbeLimit(optionSyzygyProbeLimit);
+                std::cout << "info string syzygyprobelimit " << optionSyzygyProbeLimit << "\n";
             } else if (lname == "threads" && !value.empty()) {
-                optionThreads = std::clamp(std::stoi(value), 1, 1);
+                optionThreads = std::clamp(parseIntOrDefault(value, optionThreads), 1, 1);
                 (void)optionThreads;
             }
         } else if (cmd == "ponderhit") {
             // Ponder is treated as infinite search in this engine; stop/next go controls it.
         } else if (cmd == "quit") {
             stopAndJoinSearch();
+            learningAbortGame();
             break;
         }
 
@@ -357,6 +663,19 @@ int main(int argc, char** argv)
 {
     const std::string modeArg = (argc > 1) ? std::string(argv[1]) : std::string();
     const bool graphicsMode = (modeArg == "--graphics" || modeArg == "--gui");
+
+    if (!graphicsMode && modeArg == "--tune") {
+        int maxGames = 24;
+        int moveTimeMs = 120;
+        if (argc > 2) {
+            maxGames = std::clamp(std::atoi(argv[2]), 4, 200);
+        }
+        if (argc > 3) {
+            moveTimeMs = std::clamp(std::atoi(argv[3]), 20, 2000);
+        }
+        std::cout << "tune maxGames=" << maxGames << " moveTimeMs=" << moveTimeMs << "\n";
+        return runTuneLoop(maxGames, moveTimeMs);
+    }
 
     if (!graphicsMode && modeArg == "--bench") {
         int depth = 7;
@@ -459,7 +778,7 @@ int main(int argc, char** argv)
     mutex aiMoveMutex;
 
     bool aiEnabled = false, aiPlaysWhite = false;
-    const int aiDepth = 14;
+    const int aiDepth = 10;
     optional<string> gameOverMsg = nullopt;
     optional<pair<int, int>> selectedSquare;
     vector<Move> legalMovesForSelected;

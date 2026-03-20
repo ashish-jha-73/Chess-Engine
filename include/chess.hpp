@@ -123,12 +123,14 @@ struct UndoState {
     std::optional<std::pair<int, int>> enPassantTarget;
     int halfmoveClock = 0;
     int fullmoveNumber = 1;
+    std::uint64_t zobristKey = 0;
 };
 
 Piece pieceAt(const GameState& gs, int r, int c);
 Piece pieceAtSq(const GameState& gs, int sq);
 std::string boardToString(const GameState& gs);
 std::uint64_t positionHash(const GameState& gs);
+std::uint64_t recomputePositionHash(const GameState& gs);
 
 struct GameState {
     std::array<std::array<Bitboard, 6>, 2> bitboards{};
@@ -143,6 +145,7 @@ struct GameState {
     int undoTop = 0;
     int halfmoveClock = 0;
     int fullmoveNumber = 1;
+    std::uint64_t zobristKey = 0;
     std::unordered_map<std::uint64_t, int> positionHashCounts;
     std::string initialFen;
 

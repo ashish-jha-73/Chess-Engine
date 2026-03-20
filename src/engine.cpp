@@ -4,7 +4,9 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -12,6 +14,7 @@
 #include <random>
 #include <string>
 #include <atomic>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -19,9 +22,9 @@ static constexpr int INF         =  1000000000;
 static constexpr int MATE_SCORE  =  1000000;
 static constexpr int DRAW_SCORE  =  0;
 static constexpr int MAX_DEPTH   = 100;
-static constexpr int DEFAULT_HASH_MB = 16;
+static constexpr int DEFAULT_HASH_MB = 256;
 static constexpr int QSEARCH_MAX_DEPTH = 40;
-static constexpr int QSEARCH_CHECK_DEPTH = 3;
+static constexpr int QSEARCH_CHECK_DEPTH = 4;
 
 inline int rowOfSq(int sq) { return sq / 8; }
 inline int colOfSq(int sq) { return sq % 8; }
@@ -47,8 +50,24 @@ inline bool isValidMove(const Move& m)
 
 static constexpr int MAX_PLY     = 64;   
 static constexpr int MAX_KILLERS = 2; 
+static constexpr int PV_MAX_PLY  = 256;
 
 static std::atomic<bool> g_stopRequested { false };
+static bool g_searchInfoOutputEnabled = true;
+static EngineTuningParams g_tuningParams {};
+static std::string g_syzygyPath;
+static int g_syzygyProbeLimit = 6;
+
+#if defined(__has_include)
+#if __has_include("fathom/tbprobe.h")
+#include "fathom/tbprobe.h"
+#define HAS_FATHOM_TB 1
+#else
+#define HAS_FATHOM_TB 0
+#endif
+#else
+#define HAS_FATHOM_TB 0
+#endif
 
 static constexpr int pawnTable[8][8] = {
     {  0,  0,  0,  0,  0,  0,  0,  0 },
@@ -130,12 +149,12 @@ static constexpr int kingEndTable[8][8] = {
 int pieceValue(int pt)
 {
     switch (pt) {
-        case P: return 100;
-        case N: return 320;
-        case B: return 330;
-        case R: return 500;
-        case Q: return 900;
-        case K: return 20000;
+        case P: return 120;
+        case N: return 340;
+        case B: return 350;
+        case R: return 550;
+        case Q: return 980;
+        case K: return 21000;
         default: return 0;
     }
 }
@@ -188,56 +207,182 @@ static int hangingPieceScore(const GameState& gs)
     return blackDanger - whiteDanger;
 }
 
-struct Zobrist {
-    uint64_t pieces[6][2][8][8];
-    uint64_t sideToMove;          
-    uint64_t castling[4];         
-    uint64_t enPassant[8];        
-
-    Zobrist() {
-        std::mt19937_64 rng(0xDEADBEEFCAFEBABEull);
-        auto rand64 = [&]{ return rng(); };
-
-        for (auto& a : pieces)
-            for (auto& b : a)
-                for (auto& c : b)
-                    for (auto& d : c)
-                        d = rand64();
-
-        sideToMove = rand64();
-        for (auto& x : castling)  x = rand64();
-        for (auto& x : enPassant) x = rand64();
-    }
-} static const zob;
-
-uint64_t computeHash(const GameState& gs)
+static bool isPassedPawnAt(const GameState& gs, int sq, bool white)
 {
-    uint64_t h = 0;
-    for (int color = 0; color < 2; ++color) {
-        for (int pt = 0; pt < 6; ++pt) {
-            uint64_t bb = gs.bitboards[color][pt];
-            while (bb) {
-                const uint64_t lsb = bb & -bb;
-                const int sq = __builtin_ctzll(bb);
-                bb ^= lsb;
-                const int r = sq / 8;
-                const int c = sq % 8;
-                h ^= zob.pieces[pt][color][r][c];
+    const uint64_t enemyPawns = gs.bitboards[white ? 1 : 0][P - 1];
+    const int r = rowOfSq(sq);
+    const int c = colOfSq(sq);
+
+    if (white) {
+        for (int rr = r - 1; rr >= 0; --rr) {
+            for (int cc = std::max(0, c - 1); cc <= std::min(7, c + 1); ++cc) {
+                if (enemyPawns & (1ULL << (rr * 8 + cc))) {
+                    return false;
+                }
+            }
+        }
+    } else {
+        for (int rr = r + 1; rr < 8; ++rr) {
+            for (int cc = std::max(0, c - 1); cc <= std::min(7, c + 1); ++cc) {
+                if (enemyPawns & (1ULL << (rr * 8 + cc))) {
+                    return false;
+                }
             }
         }
     }
 
-    if (!gs.wkMoved && !gs.wrHHMoved) h ^= zob.castling[0];
-    if (!gs.wkMoved && !gs.wrAHMoved) h ^= zob.castling[1];
-    if (!gs.bkMoved && !gs.brHHMoved) h ^= zob.castling[2];
-    if (!gs.bkMoved && !gs.brAHMoved) h ^= zob.castling[3];
+    return true;
+}
 
-    if (gs.enPassantTarget.has_value()) {
-        h ^= zob.enPassant[gs.enPassantTarget->second];
+static int sidePasserEndgamePressure(const GameState& gs, bool white)
+{
+    int pressure = 0;
+    uint64_t pawns = gs.bitboards[white ? 0 : 1][P - 1];
+
+    const int ownKingSq = lsbSquare64(gs.bitboards[white ? 0 : 1][K - 1]);
+    const int enemyKingSq = lsbSquare64(gs.bitboards[white ? 1 : 0][K - 1]);
+    const int ownKr = rowOfSq(ownKingSq);
+    const int ownKc = colOfSq(ownKingSq);
+    const int enemyKr = rowOfSq(enemyKingSq);
+    const int enemyKc = colOfSq(enemyKingSq);
+
+    while (pawns) {
+        const int sq = lsbSquare64(popLsb64(pawns));
+        if (!isPassedPawnAt(gs, sq, white)) {
+            continue;
+        }
+
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        const int advance = white ? (7 - r) : r;
+        if (advance < 2) {
+            continue;
+        }
+
+        const int stepSq = white ? (sq - 8) : (sq + 8);
+        const bool blockaded = (stepSq >= 0 && stepSq < 64) && (pieceAtSq(gs, stepSq).type != EMPTY);
+        const bool defended = isSquareAttacked(gs, r, c, white);
+        const bool attacked = isSquareAttacked(gs, r, c, !white);
+
+        const int promoR = white ? 0 : 7;
+        const int ownDist = std::abs(ownKr - promoR) + std::abs(ownKc - c);
+        const int enemyDist = std::abs(enemyKr - promoR) + std::abs(enemyKc - c);
+        const int kingRace = enemyDist - ownDist;
+
+        int p = advance * advance * 7;
+        p += std::max(0, (advance - 3) * 8);
+        p += std::max(0, kingRace * 5);
+        if (advance >= 5) {
+            p += 28;
+        }
+
+        if (blockaded) {
+            p -= 50 + advance * 8;
+        }
+        if (attacked && !defended) {
+            p -= 40 + advance * 6;
+        } else if (attacked) {
+            p -= 14;
+        } else if (defended) {
+            p += 12;
+        }
+
+        pressure += std::max(0, p);
     }
 
-    if (!gs.whiteToMove) h ^= zob.sideToMove;
-    return h;
+    return pressure;
+}
+
+static int sideEndgamePawnPlanScore(const GameState& gs, bool white)
+{
+    int score = 0;
+    const int side = white ? 0 : 1;
+    const int enemy = side ^ 1;
+
+    const int ownKingSq = lsbSquare64(gs.bitboards[side][K - 1]);
+    const int enemyKingSq = lsbSquare64(gs.bitboards[enemy][K - 1]);
+    const int ownKr = rowOfSq(ownKingSq);
+    const int ownKc = colOfSq(ownKingSq);
+    const int enemyKr = rowOfSq(enemyKingSq);
+    const int enemyKc = colOfSq(enemyKingSq);
+
+    uint64_t ownPawns = gs.bitboards[side][P - 1];
+    while (ownPawns) {
+        const int sq = lsbSquare64(popLsb64(ownPawns));
+        if (!isPassedPawnAt(gs, sq, white)) {
+            continue;
+        }
+
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        const int advance = white ? (7 - r) : r;
+        if (advance < 2) {
+            continue;
+        }
+
+        const int stepSq = white ? (sq - 8) : (sq + 8);
+        const bool blockaded = (stepSq >= 0 && stepSq < 64) && (pieceAtSq(gs, stepSq).type != EMPTY);
+        const int promoR = white ? 0 : 7;
+
+        const int ownDist = std::abs(ownKr - promoR) + std::abs(ownKc - c);
+        const int enemyDist = std::abs(enemyKr - promoR) + std::abs(enemyKc - c);
+        const int kingRace = enemyDist - ownDist;
+
+        int p = 22 + advance * advance * 10;
+        p += std::max(0, kingRace * 7);
+        if (!blockaded) {
+            p += 24;
+        } else {
+            p -= 48;
+        }
+
+        // King support behind/alongside passer helps conversion.
+        if ((white && ownKr <= r) || (!white && ownKr >= r)) {
+            p += 14;
+        }
+
+        score += std::max(0, p);
+    }
+
+    uint64_t enemyPawns = gs.bitboards[enemy][P - 1];
+    while (enemyPawns) {
+        const int sq = lsbSquare64(popLsb64(enemyPawns));
+        if (!isPassedPawnAt(gs, sq, !white)) {
+            continue;
+        }
+
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        const int enemyAdvance = white ? r : (7 - r);
+        if (enemyAdvance < 2) {
+            continue;
+        }
+
+        const int enemyStepSq = white ? (sq + 8) : (sq - 8);
+        const bool enemyBlockaded = (enemyStepSq >= 0 && enemyStepSq < 64) && (pieceAtSq(gs, enemyStepSq).type != EMPTY);
+        const int enemyPromoR = white ? 7 : 0;
+
+        int threat = 16 + enemyAdvance * enemyAdvance * 9;
+        if (enemyBlockaded) {
+            threat -= 44;
+        }
+
+        // Reward having king close enough to stop the passer.
+        const int ownDist = std::abs(ownKr - enemyPromoR) + std::abs(ownKc - c);
+        const int oppDist = std::abs(enemyKr - enemyPromoR) + std::abs(enemyKc - c);
+        if (ownDist + 1 <= oppDist) {
+            threat -= 26;
+        }
+
+        score -= std::max(0, threat);
+    }
+
+    return score;
+}
+
+uint64_t computeHash(const GameState& gs)
+{
+    return gs.zobristKey;
 }
 
 
@@ -313,6 +458,8 @@ struct SearchState {
     std::array<int16_t, 2 * 64 * 64 * 64> continuation{};
     int  history[2][8][8][8][8]; 
     std::array<Move, 1024> pathMoves{};
+    std::array<std::array<Move, PV_MAX_PLY>, PV_MAX_PLY> pvTable{};
+    std::array<int, PV_MAX_PLY> pvLength{};
     std::array<uint64_t, 1024> hashHistory{};
     int hashCount = 0;
     int  nodes = 0;
@@ -338,6 +485,10 @@ struct SearchState {
                     to = invalidMove();
         for (auto& m : pathMoves)
             m = invalidMove();
+        for (auto& row : pvTable)
+            for (auto& m : row)
+                m = invalidMove();
+        pvLength.fill(0);
         continuation.fill(0);
         for (auto& a : history)
             for (auto& b : a)
@@ -366,6 +517,33 @@ static int squareFromCoord(const std::string& s, int start)
     if (file < 0 || file > 7 || rank < 0 || rank > 7) return -1;
     const int row = 7 - rank;
     return row * 8 + file;
+}
+
+static std::string coordFromSquare(int sq)
+{
+    const int row = rowOfSq(sq);
+    const int col = colOfSq(sq);
+    std::string out;
+    out.push_back(static_cast<char>('a' + col));
+    out.push_back(static_cast<char>('8' - row));
+    return out;
+}
+
+static std::string moveToUciString(const Move& m)
+{
+    if (!isValidMove(m)) {
+        return "0000";
+    }
+
+    std::string out = coordFromSquare(m.from()) + coordFromSquare(m.to());
+    if (m.isPromotion()) {
+        char p = 'q';
+        if (m.promotionType() == N) p = 'n';
+        else if (m.promotionType() == B) p = 'b';
+        else if (m.promotionType() == R) p = 'r';
+        out.push_back(p);
+    }
+    return out;
 }
 
 static bool moveMatchesUci(const Move& m, const std::string& uci)
@@ -446,6 +624,40 @@ static void addBookLine(std::unordered_map<std::uint64_t, std::vector<Move>>& bo
     }
 }
 
+static void loadBookLinesFromFile(std::unordered_map<std::uint64_t, std::vector<Move>>& book,
+                                  const std::string& path)
+{
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        if (line[0] == '#') {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::vector<std::string> moves;
+        std::string mv;
+        while (iss >> mv) {
+            if (mv.size() < 4 || mv.size() > 5) {
+                moves.clear();
+                break;
+            }
+            moves.push_back(mv);
+        }
+
+        if (!moves.empty()) {
+            addBookLine(book, moves);
+        }
+    }
+}
+
 static const std::unordered_map<std::uint64_t, std::vector<Move>>& openingBook()
 {
     static const std::unordered_map<std::uint64_t, std::vector<Move>> book = [] {
@@ -512,10 +724,173 @@ static const std::unordered_map<std::uint64_t, std::vector<Move>>& openingBook()
         addBookLine(b, {"g1f3","d7d5","d2d4","g8f6","c2c4","e7e6","b1c3","f8e7"});
         addBookLine(b, {"e2e4","b8c6","d2d4","d7d5","b1c3","d5e4","d4d5","c6b8"});
 
+        // Optional external book file for large libraries.
+        loadBookLinesFromFile(b, "assets/opening_book_lines.txt");
+        loadBookLinesFromFile(b, "assets/book_lines.txt");
+        loadBookLinesFromFile(b, "opening_book_lines.txt");
+
         return b;
     }();
 
     return book;
+}
+
+struct ExperienceMoveStat {
+    Move move = invalidMove();
+    int sumScore = 0;
+    int visits = 0;
+};
+
+static std::unordered_map<uint64_t, std::vector<ExperienceMoveStat>> g_experienceBook;
+static bool g_experienceLoaded = false;
+static std::mutex g_experienceMutex;
+static constexpr int EXPERIENCE_MAX_VISITS = 30000;
+static std::unordered_map<uint64_t, std::vector<ExperienceMoveStat>> g_pendingExperience;
+static bool g_learningGameActive = true;
+static bool g_experienceLearningEnabled = true;
+
+static std::string experiencePath()
+{
+    return "assets/experience_book.txt";
+}
+
+static void loadExperienceBookIfNeeded()
+{
+    if (!g_experienceLearningEnabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_experienceMutex);
+    if (g_experienceLoaded) {
+        return;
+    }
+
+    std::ifstream in(experiencePath());
+    if (!in.is_open()) {
+        g_experienceLoaded = true;
+        return;
+    }
+
+    uint64_t hash = 0;
+    uint32_t moveValue = 0;
+    int sumScore = 0;
+    int visits = 0;
+    while (in >> hash >> moveValue >> sumScore >> visits) {
+        if (visits <= 0) {
+            continue;
+        }
+        Move m;
+        m.value = moveValue;
+        if (!isValidMove(m)) {
+            continue;
+        }
+
+        auto& vec = g_experienceBook[hash];
+        bool merged = false;
+        for (auto& e : vec) {
+            if (sameMoveIdentity(e.move, m)) {
+                e.sumScore = std::clamp(e.sumScore + sumScore, -50000000, 50000000);
+                e.visits = std::min(EXPERIENCE_MAX_VISITS, e.visits + visits);
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            ExperienceMoveStat e;
+            e.move = m;
+            e.sumScore = std::clamp(sumScore, -50000000, 50000000);
+            e.visits = std::min(EXPERIENCE_MAX_VISITS, visits);
+            vec.push_back(e);
+        }
+    }
+
+    g_experienceLoaded = true;
+}
+
+static void saveExperienceBook()
+{
+    if (!g_experienceLearningEnabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_experienceMutex);
+    std::ofstream out(experiencePath(), std::ios::trunc);
+    if (!out.is_open()) {
+        return;
+    }
+
+    for (const auto& [hash, vec] : g_experienceBook) {
+        for (const auto& e : vec) {
+            if (!isValidMove(e.move) || e.visits <= 0) {
+                continue;
+            }
+            out << hash << ' ' << e.move.value << ' ' << e.sumScore << ' ' << e.visits << '\n';
+        }
+    }
+}
+
+static void updateExperienceBookEntry(uint64_t hash, const Move& move, int score)
+{
+    auto& vec = g_experienceBook[hash];
+    for (auto& e : vec) {
+        if (sameMoveIdentity(e.move, move)) {
+            e.sumScore = std::clamp(e.sumScore + score, -50000000, 50000000);
+            e.visits = std::min(EXPERIENCE_MAX_VISITS, e.visits + 1);
+            return;
+        }
+    }
+
+    ExperienceMoveStat e;
+    e.move = move;
+    e.sumScore = score;
+    e.visits = 1;
+    vec.push_back(e);
+}
+
+static void recordPendingExperience(uint64_t hash, const Move& move, int score)
+{
+    if (!g_experienceLearningEnabled || !g_learningGameActive || !isValidMove(move)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_experienceMutex);
+    auto& vec = g_pendingExperience[hash];
+    for (auto& e : vec) {
+        if (sameMoveIdentity(e.move, move)) {
+            e.sumScore = std::clamp(e.sumScore + score, -50000000, 50000000);
+            e.visits = std::min(EXPERIENCE_MAX_VISITS, e.visits + 1);
+            return;
+        }
+    }
+
+    ExperienceMoveStat e;
+    e.move = move;
+    e.sumScore = score;
+    e.visits = 1;
+    vec.push_back(e);
+}
+
+static int experienceMoveBias(uint64_t hash, const Move& move)
+{
+    if (!g_experienceLearningEnabled) {
+        return 0;
+    }
+    loadExperienceBookIfNeeded();
+    std::lock_guard<std::mutex> lock(g_experienceMutex);
+
+    auto it = g_experienceBook.find(hash);
+    if (it == g_experienceBook.end()) {
+        return 0;
+    }
+
+    for (const auto& e : it->second) {
+        if (!sameMoveIdentity(e.move, move) || e.visits <= 0) {
+            continue;
+        }
+        const int avg = e.sumScore / e.visits;
+        const int conf = std::min(120, e.visits * 4);
+        return std::clamp((avg * conf) / 160, -240, 240);
+    }
+
+    return 0;
 }
 
 static Move bookMoveForPosition(GameState& gs)
@@ -695,9 +1070,9 @@ static int phaseDepthBonus(const GameState& gs)
 
     // Opening -> middlegame -> middle-endgame -> endgame.
     if (nonPawnMaterial >= 5000) return 0;
-    if (nonPawnMaterial >= 3000) return 2;
-    if (nonPawnMaterial >= 2000) return 4;
-    return 6;
+    if (nonPawnMaterial >= 3000) return 1;
+    if (nonPawnMaterial >= 2000) return 2;
+    return 3;
 }
 
 static int matingNetBonus(const GameState& gs, bool whiteWins)
@@ -754,22 +1129,42 @@ static int pawnStructureScoreRaw(const GameState& gs)
     uint8_t wFiles = pawnFileMask(gs, true);
     uint8_t bFiles = pawnFileMask(gs, false);
 
+    auto pawnIslands = [](uint8_t files) {
+        int islands = 0;
+        bool inIsland = false;
+        for (int c = 0; c < 8; ++c) {
+            const bool has = ((files >> c) & 1) != 0;
+            if (has && !inIsland) {
+                islands++;
+                inIsland = true;
+            } else if (!has) {
+                inIsland = false;
+            }
+        }
+        return islands;
+    };
+
+    const int whiteIslands = pawnIslands(wFiles);
+    const int blackIslands = pawnIslands(bFiles);
+    score -= std::max(0, whiteIslands - 1) * 8;
+    score += std::max(0, blackIslands - 1) * 8;
+
     for (int c = 0; c < 8; c++) {
         bool wHas = (wFiles >> c) & 1;
         bool bHas = (bFiles >> c) & 1;
         uint64_t fileMask = 0x0101010101010101ULL << c;
         int wCount = popcount64(wPawns & fileMask);
         int bCount = popcount64(bPawns & fileMask);
-        if (wCount > 1) score -= 20 * (wCount - 1);
-        if (bCount > 1) score += 20 * (bCount - 1);
+        if (wCount > 1) score -= 24 * (wCount - 1);
+        if (bCount > 1) score += 24 * (bCount - 1);
 
         bool wLeft  = (c > 0) && ((wFiles >> (c-1)) & 1);
         bool wRight = (c < 7) && ((wFiles >> (c+1)) & 1);
-        if (wHas && !wLeft && !wRight) score -= 15;
+        if (wHas && !wLeft && !wRight) score -= 20;
 
         bool bLeft  = (c > 0) && ((bFiles >> (c-1)) & 1);
         bool bRight = (c < 7) && ((bFiles >> (c+1)) & 1);
-        if (bHas && !bLeft && !bRight) score += 15;
+        if (bHas && !bLeft && !bRight) score += 20;
     }
 
     uint64_t wp = wPawns;
@@ -785,7 +1180,7 @@ static int pawnStructureScoreRaw(const GameState& gs)
         }
         if ((bPawns & frontMask) == 0) {
             int rank = 7 - r;
-            score += 20 + rank * rank * 5;
+            score += 8 + rank * rank * 2;
         }
     }
 
@@ -802,11 +1197,38 @@ static int pawnStructureScoreRaw(const GameState& gs)
         }
         if ((wPawns & frontMask) == 0) {
             int rank = r;
-            score -= 20 + rank * rank * 5;
+            score -= 8 + rank * rank * 2;
         }
     }
 
     return score;
+}
+
+static int loosePawnScore(const GameState& gs)
+{
+    auto sidePenalty = [&](bool white) {
+        int penalty = 0;
+        uint64_t pawns = gs.bitboards[white ? 0 : 1][P - 1];
+        while (pawns) {
+            const int sq = lsbSquare64(popLsb64(pawns));
+            const int r = rowOfSq(sq);
+            const int c = colOfSq(sq);
+            const bool attacked = isSquareAttacked(gs, r, c, !white);
+            if (!attacked) {
+                continue;
+            }
+            const bool defended = isSquareAttacked(gs, r, c, white);
+            if (!defended) {
+                const int advance = white ? (7 - r) : r;
+                penalty += 26 + advance * 3;
+            }
+        }
+        return penalty;
+    };
+
+    const int whitePenalty = sidePenalty(true);
+    const int blackPenalty = sidePenalty(false);
+    return blackPenalty - whitePenalty;
 }
 
 static int rookOpenFileBonusRaw(const GameState& gs)
@@ -894,6 +1316,19 @@ static int openingPrinciplesScore(const GameState& gs)
         const Piece ePawn = pieceAtSq(gs, eSq);
         if (!(dPawn.type == P && dPawn.white == white)) sideScore += 8;
         if (!(ePawn.type == P && ePawn.white == white)) sideScore += 8;
+
+        // Early wing pawn pushes around own king often distort structure.
+        const int fHome = white ? 53 : 13;
+        const int gHome = white ? 54 : 14;
+        const int hHome = white ? 55 : 15;
+        const bool fMoved = !(pieceAtSq(gs, fHome).type == P && pieceAtSq(gs, fHome).white == white);
+        const bool gMoved = !(pieceAtSq(gs, gHome).type == P && pieceAtSq(gs, gHome).white == white);
+        const bool hMoved = !(pieceAtSq(gs, hHome).type == P && pieceAtSq(gs, hHome).white == white);
+        if (undevelopedMinor >= 2) {
+            if (fMoved) sideScore -= 8;
+            if (gMoved) sideScore -= 10;
+            if (hMoved) sideScore -= 8;
+        }
 
         // Penalize king stuck in center once castling rights are gone.
         const int kingSq = lsbSquare64(gs.bitboards[side][K - 1]);
@@ -1234,6 +1669,7 @@ struct NullMoveState {
     std::optional<std::pair<int, int>> enPassantTarget;
     int halfmoveClock = 0;
     int fullmoveNumber = 1;
+    std::uint64_t zobristKey = 0;
 };
 
 static inline NullMoveState doNullMove(GameState& gs)
@@ -1243,6 +1679,7 @@ static inline NullMoveState doNullMove(GameState& gs)
     st.enPassantTarget = gs.enPassantTarget;
     st.halfmoveClock = gs.halfmoveClock;
     st.fullmoveNumber = gs.fullmoveNumber;
+    st.zobristKey = gs.zobristKey;
 
     gs.enPassantTarget = std::nullopt;
     gs.halfmoveClock++;
@@ -1250,6 +1687,7 @@ static inline NullMoveState doNullMove(GameState& gs)
         gs.fullmoveNumber++;
     }
     gs.whiteToMove = !gs.whiteToMove;
+    gs.zobristKey = recomputePositionHash(gs);
     return st;
 }
 
@@ -1259,6 +1697,75 @@ static inline void undoNullMove(GameState& gs, const NullMoveState& st)
     gs.enPassantTarget = st.enPassantTarget;
     gs.halfmoveClock = st.halfmoveClock;
     gs.fullmoveNumber = st.fullmoveNumber;
+    gs.zobristKey = st.zobristKey;
+}
+
+static bool quietMoveMayGiveCheck(const GameState& gs, const Move& m, bool sideToMove)
+{
+    if (m.isCapture() || m.isPromotion()) {
+        return false;
+    }
+
+    if (m.isCastle()) {
+        return true;
+    }
+
+    const int enemy = sideToMove ? 1 : 0;
+    const uint64_t enemyKingBB = gs.bitboards[enemy][K - 1];
+    if (!enemyKingBB) {
+        return true;
+    }
+
+    const int kingSq = lsbSquare64(enemyKingBB);
+    const int kr = rowOfSq(kingSq);
+    const int kc = colOfSq(kingSq);
+    const int fromSq = m.from();
+    const int toSq = m.to();
+    const int fr = rowOfSq(fromSq);
+    const int fc = colOfSq(fromSq);
+    const int tr = rowOfSq(toSq);
+    const int tc = colOfSq(toSq);
+
+    const Piece mover = pieceAtSq(gs, fromSq);
+    switch (mover.type) {
+        case N: {
+            const int dr = std::abs(tr - kr);
+            const int dc = std::abs(tc - kc);
+            if ((dr == 1 && dc == 2) || (dr == 2 && dc == 1)) {
+                return true;
+            }
+            break;
+        }
+        case B:
+            if (std::abs(tr - kr) == std::abs(tc - kc)) {
+                return true;
+            }
+            break;
+        case R:
+            if (tr == kr || tc == kc) {
+                return true;
+            }
+            break;
+        case Q:
+            if (tr == kr || tc == kc || std::abs(tr - kr) == std::abs(tc - kc)) {
+                return true;
+            }
+            break;
+        case K:
+            if (std::max(std::abs(tr - kr), std::abs(tc - kc)) == 1) {
+                return true;
+            }
+            break;
+        default:
+            break;
+    }
+
+    // Discovered checks are only possible if the moved piece vacates a line to the enemy king.
+    if (fr == kr || fc == kc || std::abs(fr - kr) == std::abs(fc - kc)) {
+        return true;
+    }
+
+    return false;
 }
 
 static bool isKRK(const GameState& gs, bool whiteHasRook)
@@ -1524,6 +2031,111 @@ static int neuralAwarenessScore(const GameState& gs,
     return std::clamp(out / 64, -120, 120);
 }
 
+struct NnueStyle {
+    static constexpr int KING_BUCKETS = 8;
+    static constexpr int PIECE_KIND = 10;
+    static constexpr int FEATURES = KING_BUCKETS * PIECE_KIND * 64;
+    static constexpr int HIDDEN = 48;
+
+    std::array<std::array<int16_t, HIDDEN>, FEATURES> w1{};
+    std::array<int16_t, HIDDEN> b1{};
+    std::array<int16_t, HIDDEN> w2{};
+    int16_t b2 = 0;
+
+    NnueStyle()
+    {
+        std::mt19937 rng(0x4D4E4E55u);
+        std::uniform_int_distribution<int> d1(-10, 10);
+        std::uniform_int_distribution<int> d2(-24, 24);
+        std::uniform_int_distribution<int> db(-16, 16);
+
+        for (int f = 0; f < FEATURES; ++f) {
+            for (int h = 0; h < HIDDEN; ++h) {
+                w1[f][h] = static_cast<int16_t>(d1(rng));
+            }
+        }
+        for (int h = 0; h < HIDDEN; ++h) {
+            b1[h] = static_cast<int16_t>(db(rng));
+            w2[h] = static_cast<int16_t>(d2(rng));
+        }
+        b2 = static_cast<int16_t>(db(rng));
+    }
+
+    static int kingBucket(int sq)
+    {
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        return (r / 2) * 2 + (c / 4);
+    }
+
+    static int orientSquare(int sq, bool perspectiveWhite)
+    {
+        if (perspectiveWhite) return sq;
+        const int r = rowOfSq(sq);
+        const int c = colOfSq(sq);
+        return (7 - r) * 8 + c;
+    }
+
+    static int pieceKindIndex(const Piece& p, bool perspectiveWhite)
+    {
+        if (p.type == EMPTY || p.type == K) return -1;
+        const bool own = (p.white == perspectiveWhite);
+        const int base = own ? 0 : 5;
+        switch (p.type) {
+            case P: return base + 0;
+            case N: return base + 1;
+            case B: return base + 2;
+            case R: return base + 3;
+            case Q: return base + 4;
+            default: return -1;
+        }
+    }
+
+    int perspectiveScore(const GameState& gs, bool perspectiveWhite) const
+    {
+        const int side = perspectiveWhite ? 0 : 1;
+        const uint64_t kingBb = gs.bitboards[side][K - 1];
+        if (!kingBb) return 0;
+
+        const int ksq = lsbSquare64(kingBb);
+        const int bucket = kingBucket(orientSquare(ksq, perspectiveWhite));
+
+        std::array<int, HIDDEN> acc{};
+        for (int h = 0; h < HIDDEN; ++h) {
+            acc[h] = b1[h];
+        }
+
+        for (int sq = 0; sq < 64; ++sq) {
+            const Piece p = pieceAtSq(gs, sq);
+            const int kind = pieceKindIndex(p, perspectiveWhite);
+            if (kind < 0) continue;
+
+            const int osq = orientSquare(sq, perspectiveWhite);
+            const int feat = ((bucket * PIECE_KIND + kind) * 64) + osq;
+            for (int h = 0; h < HIDDEN; ++h) {
+                acc[h] += w1[feat][h];
+            }
+        }
+
+        int out = b2;
+        for (int h = 0; h < HIDDEN; ++h) {
+            const int a = std::clamp(acc[h], 0, 127);
+            out += (a * w2[h]);
+        }
+
+        return out / 32;
+    }
+
+    int evaluate(const GameState& gs) const
+    {
+        const int white = perspectiveScore(gs, true);
+        const int black = perspectiveScore(gs, false);
+        return std::clamp(white - black, -280, 280);
+    }
+};
+
+static const NnueStyle g_nnueStyle;
+
 static int evaluate(const GameState& gs)
 {
     int baseScore = ss.evalActive ? ss.evalCoreNoKingStack[ss.evalPly] : computeCoreEvalNoKing(gs);
@@ -1552,6 +2164,26 @@ static int evaluate(const GameState& gs)
     mgScore += hanging;
     egScore += hanging / 2;
 
+    const int loosePawns = loosePawnScore(gs);
+    mgScore += loosePawns;
+    egScore += loosePawns / 2;
+
+    const int whitePasserPressure = sidePasserEndgamePressure(gs, true);
+    const int blackPasserPressure = sidePasserEndgamePressure(gs, false);
+    const int passerPressure = whitePasserPressure - blackPasserPressure;
+    mgScore += passerPressure / 6;
+    egScore += (passerPressure * 3) / 4;
+
+    if (eg) {
+        const int whitePawnPlan = sideEndgamePawnPlanScore(gs, true);
+        const int blackPawnPlan = sideEndgamePawnPlanScore(gs, false);
+        const int pawnPlan = whitePawnPlan - blackPawnPlan;
+
+        // Increase pawn-plan priority as we approach very low non-pawn material.
+        const int veryEgWeight = std::max(0, 10 - phase);
+        egScore += pawnPlan + (pawnPlan * veryEgWeight) / 6;
+    }
+
     const int mob = mobilityScore(gs);
     mgScore += mob;
     egScore += mob / 2;
@@ -1565,24 +2197,27 @@ static int evaluate(const GameState& gs)
         mgScore += openingScore;
     }
 
-    const int awareness = neuralAwarenessScore(gs,
-                                               baseScore,
-                                               pawnStructure,
-                                               rookOpenFile,
-                                               bishopPair,
-                                               mob,
-                                               kingSafety,
-                                               openingScore,
-                                               phase);
+     const int awareness = neuralAwarenessScore(gs,
+                                                              baseScore,
+                                                              pawnStructure,
+                                                              rookOpenFile,
+                                                              bishopPair,
+                                                              mob,
+                                                              kingSafety,
+                                                              openingScore,
+                                                              phase);
     mgScore += awareness;
     egScore += awareness / 2;
+
+    const int nnue = g_nnueStyle.evaluate(gs);
+    mgScore += (nnue * g_tuningParams.nnueMgWeight) / std::max(1, g_tuningParams.nnueWeightDiv);
+    egScore += (nnue * g_tuningParams.nnueEgWeight) / std::max(1, g_tuningParams.nnueWeightDiv);
 
     egScore += rookEndgameOffset(gs);
 
     if (eg) {
         if (hasMatingMaterial(gs, true))  egScore += matingNetBonus(gs, true);
         if (hasMatingMaterial(gs, false)) egScore -= matingNetBonus(gs, false);
-
         if (isKRK(gs, true)) {
             egScore += krkBonus(gs, true);
         } else if (isKRK(gs, false)) {
@@ -1607,6 +2242,29 @@ static int evaluate(const GameState& gs)
     return gs.whiteToMove ? score : -score;
 }
 
+static int staticExchangeEval(const GameState& gs, const Move& m);
+
+static bool probeSyzygyWdl(const GameState& gs, int ply, int& score)
+{
+    const int pieceCount = popcount64(gs.occupancyBoth);
+    if (pieceCount > g_syzygyProbeLimit || g_syzygyPath.empty()) {
+        return false;
+    }
+
+#if HAS_FATHOM_TB
+    // Adapter placeholder: this engine uses custom state and still needs
+    // explicit mapping from GameState to Fathom's probe input format.
+    (void)gs;
+    (void)ply;
+    (void)score;
+    return false;
+#else
+    (void)gs;
+    (void)ply;
+    (void)score;
+    return false;
+#endif
+}
 
 static int scoreMoveForOrdering(const GameState& gs, const Move& m, int ply, const Move& ttMove)
 {
@@ -1618,7 +2276,11 @@ static int scoreMoveForOrdering(const GameState& gs, const Move& m, int ply, con
         const int fromC = colOfSq(m.from());
         int victim   = pieceValue(m.capturedType());
         int attacker = pieceValue(pieceAt(gs, fromR, fromC).type);
-        return 1'000'000 + (victim * 10) - attacker;
+        int see = 0;
+        if (!m.isEnPassant() && ply <= 6) {
+            see = std::clamp(staticExchangeEval(gs, m), -300, 300);
+        }
+        return 1'000'000 + (victim * 10) - attacker + (see * 3);
     }
 
     if (m.isPromotion()) return 900000;
@@ -1780,6 +2442,9 @@ static void generateQuietCheckingMoves(GameState& gs, MoveList& out)
     for (int i = 0; i < pseudo.count; ++i) {
         const Move& m = pseudo.moves[i];
         if (m.isCapture() || m.isPromotion()) {
+            continue;
+        }
+        if (!quietMoveMayGiveCheck(gs, m, sideToCheck)) {
             continue;
         }
 
@@ -1988,6 +2653,11 @@ static int quiescence(GameState& gs, int alpha, int beta, int ply, int qDepth)
 {
     ss.nodes++;
 
+    int tbScore = 0;
+    if (probeSyzygyWdl(gs, ply, tbScore)) {
+        return tbScore;
+    }
+
     const int alphaOrig = alpha;
     const uint64_t hash = computeHash(gs);
     TTEntry* entry = tt.probe(hash);
@@ -2067,13 +2737,13 @@ static int quiescence(GameState& gs, int alpha, int beta, int ply, int qDepth)
                 promotionGain = pieceValue(m.promotionType()) - pieceValue(P);
             }
 
-            // Delta pruning: skip tactical moves that cannot raise alpha enough.
-            if (stand_pat + captured + promotionGain + 180 <= alpha) {
+            // Strength-first delta pruning margin to avoid dropping critical tactics.
+            if (stand_pat + captured + promotionGain + g_tuningParams.qsearchDeltaMargin <= alpha) {
                 continue;
             }
         }
 
-        if (m.isCapture() && !m.isEnPassant() && staticExchangeEval(gs, m) < -90) {
+        if (m.isCapture() && !m.isEnPassant() && staticExchangeEval(gs, m) < -g_tuningParams.qsearchSeeThreshold) {
             continue;
         }
 
@@ -2116,11 +2786,20 @@ static int quiescence(GameState& gs, int alpha, int beta, int ply, int qDepth)
 }
 
 static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
-                   bool nullMoveAllowed)
+                   bool nullMoveAllowed, const Move* excludedMove = nullptr)
 {
     if (ss.timeUp()) { ss.stopped = true; return 0; }
 
     ss.nodes++;
+
+    int tbScore = 0;
+    if (probeSyzygyWdl(gs, ply, tbScore)) {
+        return tbScore;
+    }
+
+    if (ply < PV_MAX_PLY) {
+        ss.pvLength[ply] = ply;
+    }
 
     uint64_t hash = computeHash(gs);
     if (ply > 0 && isThreefoldInSearch(hash)) {
@@ -2157,7 +2836,7 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     // IID: if no TT move at a deeper node, do a small pre-search to seed TT ordering.
     if (!isValidMove(ttBestMove) && depth >= 6 && !inCheck && !pvNode) {
-        (void)negamax(gs, depth - 2, alpha, beta, ply, false);
+        (void)negamax(gs, depth - 2, alpha, beta, ply, false, nullptr);
         if (!ss.stopped) {
             if (TTEntry* iidEntry = tt.probe(hash)) {
                 ttBestMove = iidEntry->bestMove;
@@ -2174,78 +2853,71 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
 
     int staticEval = 0;
     int tacticalDanger = 0;
+    int passerDanger = 0;
+    bool highStrategicDanger = false;
     if (!inCheck) {
         staticEval = evaluate(gs);
         tacticalDanger = sideHangingDanger(gs, gs.whiteToMove);
+        passerDanger = sidePasserEndgamePressure(gs, gs.whiteToMove);
+        const bool highDanger = (tacticalDanger >= 56) || (passerDanger >= 95);
+        highStrategicDanger = highDanger;
 
-        if (!pvNode && depth <= 2) {
-            const int margin = 180 + depth * 110;
-            if (tacticalDanger < 56 && staticEval - margin >= beta) {
-                return staticEval;
-            }
+        if (!pvNode && !highDanger && depth == 1) {
+            if (staticEval + 120 <= alpha) return staticEval;
         }
 
-        if (depth == 1) {
-            const int rfpMargin = 150;
-            if (tacticalDanger < 56 && staticEval - rfpMargin >= beta) {
+        if (!pvNode && depth <= 2) {
+            const int margin = 260 + depth * 140;
+            if (!highDanger && staticEval - margin >= beta) {
                 return staticEval;
             }
         }
     }
 
     MoveList moves;
-    generateLegalMoves(gs, moves);
+    generatePseudoLegalMoves(gs, moves);
 
-    if (moves.empty()) {
-        if (inCheck)
-            return -(MATE_SCORE - ply);   
-        return DRAW_SCORE;
-    }
-
-    if (nullMoveAllowed && depth >= 3 && !inCheck && hasNonPawnMaterial(gs, gs.whiteToMove))
+    if (nullMoveAllowed && depth >= 3 && !inCheck && !highStrategicDanger && hasNonPawnMaterial(gs, gs.whiteToMove))
     {
         const NullMoveState nullState = doNullMove(gs);
         int R = 2;
         if (depth >= 9 && staticEval >= beta + 120) {
             R = 3;
         }
-        int nullScore = -negamax(gs, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
+        int nullScore = -negamax(gs, depth - 1 - R, -beta, -beta + 1, ply + 1, false, nullptr);
         undoNullMove(gs, nullState);
 
-        if (!ss.stopped && nullScore >= beta)
-            return beta;
+        if (!ss.stopped && nullScore >= beta) {
+            // Verification search reduces false null-move cutoffs (zugzwang-ish cases).
+            if (depth >= g_tuningParams.nullVerifyMinDepth) {
+                const int verify = negamax(gs, depth - 1 - R, beta - 1, beta, ply + 1, false, nullptr);
+                if (ss.stopped) return 0;
+                if (verify >= beta) {
+                    return beta;
+                }
+            } else {
+                return beta;
+            }
+        }
     }
 
     sortMoves(moves, gs, ply, ttBestMove);
 
     TTFlag flag = TT_UPPER;
-    Move bestMove = moves.moves[0];
+    Move bestMove = invalidMove();
     int  bestScore = -INF;
     int  moveCount = 0;
     std::array<Move, 64> quietTried{};
     int quietTriedCount = 0;
-    const bool highTacticalDanger = tacticalDanger >= 56;
-    const bool useFutility = !inCheck && depth == 1 && !highTacticalDanger;
+    const bool useFutility = !inCheck && depth == 1 && !highStrategicDanger;
     const int futilityBase = staticEval;
 
     for (int i = 0; i < moves.count; ++i) {
         Move& m = moves.moves[i];
-        moveCount++;
+        if (excludedMove && sameMoveIdentity(m, *excludedMove)) {
+            continue;
+        }
         const bool quietMove = !m.isCapture() && !m.isPromotion();
-
-        if (useFutility && moveCount > 3 && quietMove) {
-            const int futilityMargin = 120;
-            if (futilityBase + futilityMargin <= alpha) {
-                continue;
-            }
-        }
-
-        if (!pvNode && !inCheck && !highTacticalDanger && quietMove && depth <= 3 && moveCount > (4 + depth * 4)) {
-            const int lmpMargin = 180 + depth * 120;
-            if (futilityBase + lmpMargin <= alpha) {
-                continue;
-            }
-        }
 
         int quietHistory = 0;
         if (quietMove && m.from() < 64 && m.to() < 64) {
@@ -2253,29 +2925,97 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
             quietHistory = ss.history[side][rowOfSq(m.from())][colOfSq(m.from())][rowOfSq(m.to())][colOfSq(m.to())];
         }
 
-        if (quietMove && quietTriedCount < static_cast<int>(quietTried.size())) {
-            quietTried[quietTriedCount++] = m;
-        }
-
         if (ply < static_cast<int>(ss.pathMoves.size())) {
             ss.pathMoves[ply] = m;
         }
 
         searchMakeMove(gs, m);
+        const bool legal = !isInCheck(gs, !gs.whiteToMove);
+        if (!legal) {
+            searchUndoMove(gs);
+            continue;
+        }
+
+        moveCount++;
+
         const bool givesCheck = isInCheck(gs, gs.whiteToMove);
+
+        if (!pvNode && !inCheck && depth <= 4 && m.isCapture() && !m.isPromotion() && !givesCheck) {
+            const int see = staticExchangeEval(gs, m);
+            if (see < -120 * depth) {
+                searchUndoMove(gs);
+                continue;
+            }
+        }
+
+        if (useFutility && moveCount > 3 && quietMove && !givesCheck && quietHistory < 7000) {
+            const int futilityMargin = g_tuningParams.futilityBaseMargin + depth * g_tuningParams.futilityDepthMargin;
+            if (futilityBase + futilityMargin <= alpha) {
+                searchUndoMove(gs);
+                continue;
+            }
+        }
+
+        if (!pvNode && !inCheck && !highStrategicDanger && quietMove && !givesCheck && quietHistory < 5000
+            && depth <= 3 && moveCount > (6 + depth * 5)) {
+            const int lmpMargin = g_tuningParams.lmpBaseMargin + depth * g_tuningParams.lmpDepthMargin;
+            if (futilityBase + lmpMargin <= alpha) {
+                searchUndoMove(gs);
+                continue;
+            }
+        }
+
+        if (quietMove && quietTriedCount < static_cast<int>(quietTried.size())) {
+            quietTried[quietTriedCount++] = m;
+        }
+
+        int extension = 0;
+        if (!m.isCapture() && givesCheck && depth >= 2 && depth <= 6 && moveCount <= 6) {
+            extension = 1;
+        }
+
+        if (!pvNode && !inCheck && !excludedMove && depth >= 7 && moveCount <= 2
+            && isValidMove(ttBestMove) && sameMoveIdentity(m, ttBestMove)
+            && entry && entry->depth >= depth - 2 && entry->flag != TT_UPPER) {
+            const int ttScore = scoreFromTT(entry->score, ply);
+            const int margin = g_tuningParams.singularBaseMargin + depth * g_tuningParams.singularDepthMargin;
+            const int singularBeta = ttScore - margin;
+            const int singularDepth = std::max(1, depth / 2);
+
+            const int singular = negamax(gs,
+                                         singularDepth,
+                                         singularBeta - 1,
+                                         singularBeta,
+                                         ply + 1,
+                                         false,
+                                         &m);
+            if (!ss.stopped && singular < singularBeta) {
+                extension += (depth >= 10) ? 2 : 1;
+            }
+        }
+
+        if (m.isCapture() && ply > 0 && ply < static_cast<int>(ss.pathMoves.size())) {
+            const Move& prev = ss.pathMoves[ply - 1];
+            if (isValidMove(prev) && m.to() == prev.to() && depth >= 3 && depth <= 8) {
+                extension = 1;
+            }
+        }
+        extension = std::min(extension, 2);
+        const int searchDepth = depth - 1 + extension;
 
         int score;
         if (moveCount == 1) {
-            score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
-        } else if (!pvNode && quietMove && depth >= 4 && moveCount > 4 && !givesCheck) {
-            int reduction = 1;
-            if (moveCount > 8) reduction++;
-            if (moveCount > 16) reduction++;
-            if (depth >= 8 && moveCount > 20) reduction++;
+            score = -negamax(gs, searchDepth, -beta, -alpha, ply + 1, true, nullptr);
+        } else if (!pvNode && quietMove && depth >= 3 && moveCount > 3 && !givesCheck) {
+            int reduction = static_cast<int>(std::log(static_cast<double>(depth))
+                                                * std::log(static_cast<double>(moveCount)));
+            if (reduction > 0) {
+                reduction -= 1;
+            }
             if (quietHistory > 8000 && reduction > 1) reduction--;
             if (quietHistory < -4000 && reduction < depth - 2) reduction++;
-            reduction = std::min(reduction, depth - 2);
-            if (highTacticalDanger && reduction > 1) reduction--;
+            reduction = std::max(1, std::min(reduction, std::max(1, searchDepth - 1)));
+            if (highStrategicDanger && reduction > 1) reduction--;
 
             if (ply > 0 && ply < static_cast<int>(ss.pathMoves.size())) {
                 const Move& prev = ss.pathMoves[ply - 1];
@@ -2287,13 +3027,13 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
                 }
             }
 
-            score = -negamax(gs, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, true);
+            score = -negamax(gs, std::max(0, searchDepth - reduction), -alpha - 1, -alpha, ply + 1, true, nullptr);
             if (score > alpha)
-                score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
+                score = -negamax(gs, searchDepth, -beta, -alpha, ply + 1, true, nullptr);
         } else {
-            score = -negamax(gs, depth - 1, -alpha - 1, -alpha, ply + 1, true);
+            score = -negamax(gs, searchDepth, -alpha - 1, -alpha, ply + 1, true, nullptr);
             if (score > alpha)
-                score = -negamax(gs, depth - 1, -beta, -alpha, ply + 1, true);
+                score = -negamax(gs, searchDepth, -beta, -alpha, ply + 1, true, nullptr);
         }
 
         searchUndoMove(gs);
@@ -2308,6 +3048,19 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
         if (score > alpha) {
             alpha = score;
             flag  = TT_EXACT;
+
+            if (ply < PV_MAX_PLY) {
+                ss.pvTable[ply][ply] = m;
+                int nextLen = (ply + 1 < PV_MAX_PLY) ? ss.pvLength[ply + 1] : (ply + 1);
+                if (nextLen < ply + 1) {
+                    nextLen = ply + 1;
+                }
+                const int copyEnd = std::min(nextLen, PV_MAX_PLY);
+                for (int j = ply + 1; j < copyEnd; ++j) {
+                    ss.pvTable[ply][j] = ss.pvTable[ply + 1][j];
+                }
+                ss.pvLength[ply] = copyEnd;
+            }
 
             if (quietMove) {
                 updateHistoryBonus(gs, m, std::max(1, depth / 2));
@@ -2333,20 +3086,27 @@ static int negamax(GameState& gs, int depth, int alpha, int beta, int ply,
         }
     }
 
+    if (moveCount == 0) {
+        if (inCheck)
+            return -(MATE_SCORE - ply);
+        return DRAW_SCORE;
+    }
+
     tt.store(hash, scoreToTT(bestScore, ply), depth, flag, bestMove);
     return bestScore;
 }
 
 Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
 {
-    clearStopSearch();
+    if (g_experienceLearningEnabled) {
+        loadExperienceBookIfNeeded();
+    }
 
-    if (timeLimitMs >= 10000) {
-        Move bookMove = bookMoveForPosition(gs);
-        if (isValidMove(bookMove)) {
-            lastSearchStats = SearchStats {};
-            return bookMove;
-        }
+    Move bookMove = bookMoveForPosition(gs);
+    if (isValidMove(bookMove)) {
+        recordPendingExperience(computeHash(gs), bookMove, 0);
+        lastSearchStats = SearchStats {};
+        return bookMove;
     }
 
     MoveList moves;
@@ -2367,26 +3127,81 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
     maxDepth += phaseDepthBonus(gs);
     const int rootEval = evaluate(gs);
 
-    Move bestMove = moves.moves[0];
-    int  bestScore = -INF;
+    Move fallbackBestMove = moves.moves[0];
+    int fallbackBestScore = -INF;
+    for (int i = 0; i < moves.count; ++i) {
+        Move& m = moves.moves[i];
+        ss.pathMoves[0] = m;
+        searchMakeMove(gs, m);
+        const int score = -evaluate(gs);
+        searchUndoMove(gs);
+
+        if (score > fallbackBestScore) {
+            fallbackBestScore = score;
+            fallbackBestMove = m;
+        }
+    }
+
+    Move bestMove = fallbackBestMove;
+    int  bestScore = fallbackBestScore;
     int  depthReached = 0;
     int  prevIterScore = 0;
     bool hasPrevIterScore = false;
-    auto searchRootWindow = [&](int depth, int alpha, int beta, Move& outBestMove) -> int {
+    auto searchRootWindow = [&](int depth,
+                                int alpha,
+                                int beta,
+                                Move& outBestMove,
+                                std::array<Move, PV_MAX_PLY>& outPv,
+                                int& outPvLen) -> int {
         int localBestScore = -INF;
         Move localBestMove = moves.moves[0];
+        std::array<Move, PV_MAX_PLY> localPv{};
+        for (auto& pm : localPv) {
+            pm = invalidMove();
+        }
+        int localPvLen = 1;
 
         uint64_t hash = computeHash(gs);
         TTEntry* e = tt.probe(hash);
-        Move ttMove = (e && isValidMove(e->bestMove))
-            ? e->bestMove
-            : invalidMove();
+        Move ttMove = invalidMove();
+        if (e && isValidMove(e->bestMove)) {
+            ttMove = e->bestMove;
+        } else if (hasPrevIterScore && isValidMove(bestMove)) {
+            // Reuse previous iteration's PV head to stabilize root ordering.
+            ttMove = bestMove;
+        }
         sortMoves(moves, gs, 0, ttMove);
+        if (g_experienceLearningEnabled) {
+            std::vector<std::pair<Move, int>> decorated;
+            decorated.reserve(static_cast<size_t>(moves.count));
+            for (int i = 0; i < moves.count; ++i) {
+                decorated.emplace_back(moves.moves[i], experienceMoveBias(hash, moves.moves[i]));
+            }
+
+            std::stable_sort(decorated.begin(), decorated.end(), [](const auto& a, const auto& b) {
+                return a.second > b.second;
+            });
+
+            for (int i = 0; i < moves.count; ++i) {
+                moves.moves[i] = decorated[static_cast<size_t>(i)].first;
+            }
+        }
 
         int localAlpha = alpha;
 
         for (int i = 0; i < moves.count; ++i) {
             Move& m = moves.moves[i];
+            const Piece rootMover = pieceAtSq(gs, m.from());
+            const bool rootHeavyMover = (rootMover.type == Q || rootMover.type == R);
+            int rootSafetyMalus = 0;
+
+            if (rootEval >= 220 && rootHeavyMover && m.isCapture() && !m.isEnPassant()) {
+                const int see = staticExchangeEval(gs, m);
+                if (see < -100) {
+                    rootSafetyMalus += std::min(1200, (-see * 3) / 2);
+                }
+            }
+
             ss.pathMoves[0] = m;
             searchMakeMove(gs, m);
 
@@ -2419,16 +3234,42 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
                 }
             }
 
+            if (rootEval >= 220 && rootHeavyMover) {
+                const int tr = rowOfSq(m.to());
+                const int tc = colOfSq(m.to());
+                const bool attacked = isSquareAttacked(gs, tr, tc, gs.whiteToMove);
+                const bool defended = isSquareAttacked(gs, tr, tc, !gs.whiteToMove);
+                if (attacked && !defended) {
+                    rootSafetyMalus += (rootMover.type == Q) ? 780 : 420;
+                }
+            }
+
+            if (rootSafetyMalus > 0 && std::abs(score) < (MATE_SCORE - 1024)) {
+                // When clearly ahead, prefer safer conversion lines over material blunders.
+                if (score < rootEval + 280) {
+                    score -= rootSafetyMalus;
+                } else {
+                    score -= rootSafetyMalus / 3;
+                }
+            }
+
             searchUndoMove(gs);
 
             if (ss.stopped) {
                 outBestMove = localBestMove;
+                outPv = localPv;
+                outPvLen = localPvLen;
                 return localBestScore;
             }
 
             if (score > localBestScore) {
                 localBestScore = score;
                 localBestMove = m;
+
+                localPvLen = std::clamp(ss.pvLength[1], 1, PV_MAX_PLY);
+                for (int j = 1; j < localPvLen; ++j) {
+                    localPv[j] = ss.pvTable[1][j];
+                }
             }
             if (score > localAlpha) {
                 localAlpha = score;
@@ -2439,11 +3280,18 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
         }
 
         outBestMove = localBestMove;
+        outPv = localPv;
+        outPvLen = localPvLen;
         return localBestScore;
     };
 
     for (int depth = 1; depth <= maxDepth; depth++) {
         Move currentBest = moves.moves[0];
+        std::array<Move, PV_MAX_PLY> currentPv{};
+        for (auto& pm : currentPv) {
+            pm = invalidMove();
+        }
+        int currentPvLen = 1;
         int currentBestScore = -INF;
 
         int alpha = -INF;
@@ -2454,7 +3302,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
             beta = std::min(INF, prevIterScore + delta);
         }
 
-        currentBestScore = searchRootWindow(depth, alpha, beta, currentBest);
+        currentBestScore = searchRootWindow(depth, alpha, beta, currentBest, currentPv, currentPvLen);
         if (ss.stopped) goto done;
 
         if (hasPrevIterScore && depth >= 3 && (currentBestScore <= alpha || currentBestScore >= beta)) {
@@ -2467,7 +3315,7 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
                     beta = std::min(INF, beta + widen);
                 }
 
-                currentBestScore = searchRootWindow(depth, alpha, beta, currentBest);
+                currentBestScore = searchRootWindow(depth, alpha, beta, currentBest, currentPv, currentPvLen);
                 if (ss.stopped) goto done;
 
                 if (currentBestScore > alpha && currentBestScore < beta) {
@@ -2484,10 +3332,72 @@ Move computeBestMove(GameState gs, int maxDepth, int timeLimitMs)
         prevIterScore = bestScore;
         hasPrevIterScore = true;
 
-        std::cout << "info depth " << depth << "  score cp " << bestScore << "  nodes " << ss.nodes << "\n";
+        if (g_searchInfoOutputEnabled) {
+            std::string pvLine = moveToUciString(currentBest);
+            {
+                GameState pvState = gs;
+                makeMove(pvState, currentBest, false);
+
+                const int pvEnd = std::min(currentPvLen, PV_MAX_PLY);
+                for (int j = 1; j < pvEnd; ++j) {
+                    const Move& pm = currentPv[j];
+                    if (!isValidMove(pm)) {
+                        break;
+                    }
+
+                    MoveList legal;
+                    generateLegalMoves(pvState, legal);
+                    bool found = false;
+                    Move legalMove = invalidMove();
+                    for (int k = 0; k < legal.count; ++k) {
+                        if (sameMoveIdentity(legal.moves[k], pm)) {
+                            found = true;
+                            legalMove = legal.moves[k];
+                            break;
+                        }
+                    }
+
+                    if (!found) {
+                        break;
+                    }
+
+                    pvLine += " ";
+                    pvLine += moveToUciString(legalMove);
+                    makeMove(pvState, legalMove, false);
+                }
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now - ss.startTime).count());
+            if (elapsedMs <= 0) elapsedMs = 1;
+            const int nps = static_cast<int>((static_cast<long long>(ss.nodes) * 1000LL) / elapsedMs);
+
+            auto isMateScore = [](int s) {
+                return std::abs(s) >= (MATE_SCORE - 512);
+            };
+
+            std::cout << "info depth " << depth;
+            if (isMateScore(bestScore)) {
+                int matePlies = std::max(1, MATE_SCORE - std::abs(bestScore));
+                int mateMoves = (matePlies + 1) / 2;
+                if (bestScore < 0) mateMoves = -mateMoves;
+                std::cout << " score mate " << mateMoves;
+            } else {
+                std::cout << " score cp " << bestScore;
+            }
+            std::cout << " nodes " << ss.nodes
+                      << " time " << elapsedMs
+                      << " nps " << nps
+                      << " pv " << pvLine << "\n";
+        }
     }
 
 done:
+    if (isValidMove(bestMove)) {
+        const uint64_t rootHash = computeHash(gs);
+        recordPendingExperience(rootHash, bestMove, bestScore);
+    }
+
     {
         auto endTime = std::chrono::steady_clock::now();
         int elapsedMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(endTime - ss.startTime).count());
@@ -2531,4 +3441,133 @@ void setHashSizeMb(int mb)
 int getHashSizeMb()
 {
     return tt.hashMb;
+}
+
+void setTuningParams(const EngineTuningParams& p)
+{
+    EngineTuningParams c = p;
+    c.futilityBaseMargin = std::clamp(c.futilityBaseMargin, 0, 1200);
+    c.futilityDepthMargin = std::clamp(c.futilityDepthMargin, 0, 600);
+    c.lmpBaseMargin = std::clamp(c.lmpBaseMargin, 0, 1200);
+    c.lmpDepthMargin = std::clamp(c.lmpDepthMargin, 0, 600);
+    c.qsearchDeltaMargin = std::clamp(c.qsearchDeltaMargin, 0, 1200);
+    c.qsearchSeeThreshold = std::clamp(c.qsearchSeeThreshold, 0, 1200);
+    c.singularBaseMargin = std::clamp(c.singularBaseMargin, 0, 800);
+    c.singularDepthMargin = std::clamp(c.singularDepthMargin, 0, 120);
+    c.nnueMgWeight = std::clamp(c.nnueMgWeight, 0, 300);
+    c.nnueEgWeight = std::clamp(c.nnueEgWeight, 0, 300);
+    c.nnueWeightDiv = std::clamp(c.nnueWeightDiv, 1, 300);
+    c.nullVerifyMinDepth = std::clamp(c.nullVerifyMinDepth, 2, 24);
+    g_tuningParams = c;
+}
+
+EngineTuningParams getTuningParams()
+{
+    return g_tuningParams;
+}
+
+void setSyzygyPath(const std::string& path)
+{
+    g_syzygyPath = path;
+}
+
+std::string getSyzygyPath()
+{
+    return g_syzygyPath;
+}
+
+void setSyzygyProbeLimit(int pieces)
+{
+    g_syzygyProbeLimit = std::clamp(pieces, 3, 7);
+}
+
+int getSyzygyProbeLimit()
+{
+    return g_syzygyProbeLimit;
+}
+
+void setSearchInfoOutputEnabled(bool enabled)
+{
+    g_searchInfoOutputEnabled = enabled;
+}
+
+bool isSearchInfoOutputEnabled()
+{
+    return g_searchInfoOutputEnabled;
+}
+
+void learningStartGame()
+{
+    if (!g_experienceLearningEnabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_experienceMutex);
+    g_pendingExperience.clear();
+    g_learningGameActive = true;
+}
+
+void learningAbortGame()
+{
+    if (!g_experienceLearningEnabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_experienceMutex);
+    g_pendingExperience.clear();
+    g_learningGameActive = false;
+}
+
+void learningFinalizeGame()
+{
+    if (!g_experienceLearningEnabled) {
+        return;
+    }
+    loadExperienceBookIfNeeded();
+    bool hadPending = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_experienceMutex);
+        for (const auto& [_, vec] : g_pendingExperience) {
+            if (!vec.empty()) {
+                hadPending = true;
+                break;
+            }
+        }
+
+        if (!hadPending) {
+            g_learningGameActive = false;
+            return;
+        }
+
+        for (const auto& [hash, vec] : g_pendingExperience) {
+            for (const auto& e : vec) {
+                if (!isValidMove(e.move) || e.visits <= 0) {
+                    continue;
+                }
+                // Replay each visit as one update to preserve averaging behavior.
+                const int avg = e.sumScore / std::max(1, e.visits);
+                for (int i = 0; i < e.visits; ++i) {
+                    updateExperienceBookEntry(hash, e.move, avg);
+                }
+            }
+        }
+        g_pendingExperience.clear();
+        g_learningGameActive = false;
+    }
+
+    saveExperienceBook();
+}
+
+void setExperienceLearningEnabled(bool enabled)
+{
+    g_experienceLearningEnabled = enabled;
+    if (!enabled) {
+        learningAbortGame();
+    } else {
+        learningStartGame();
+    }
+}
+
+bool isExperienceLearningEnabled()
+{
+    return g_experienceLearningEnabled;
 }

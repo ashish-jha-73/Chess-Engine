@@ -2,6 +2,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <random>
 #include <sstream>
 #include <vector>
 
@@ -25,6 +26,88 @@ inline Piece decodePiece(std::uint8_t code)
     return Piece { static_cast<std::uint8_t>(code & 0x7), (code & 0x8) == 0 };
 }
 
+struct ZobristKeys {
+    std::array<std::array<std::array<Bitboard, 64>, 6>, 2> piece{};
+    std::array<Bitboard, 16> castling{};
+    std::array<Bitboard, 64> enPassant{};
+    Bitboard sideToMove = 0;
+};
+
+ZobristKeys initZobristKeys()
+{
+    ZobristKeys z;
+    std::mt19937_64 rng(0x9E3779B97F4A7C15ULL);
+    auto rand64 = [&]() { return static_cast<Bitboard>(rng()); };
+
+    for (int color = 0; color < 2; ++color) {
+        for (int pt = 0; pt < 6; ++pt) {
+            for (int sq = 0; sq < 64; ++sq) {
+                z.piece[color][pt][sq] = rand64();
+            }
+        }
+    }
+    for (int i = 0; i < 16; ++i) {
+        z.castling[i] = rand64();
+    }
+    for (int sq = 0; sq < 64; ++sq) {
+        z.enPassant[sq] = rand64();
+    }
+    z.sideToMove = rand64();
+    return z;
+}
+
+const ZobristKeys ZOBRIST = initZobristKeys();
+
+inline int castlingRightsMask(const GameState& gs)
+{
+    int mask = 0;
+    if (!gs.wkMoved && !gs.wrHHMoved) mask |= 1;
+    if (!gs.wkMoved && !gs.wrAHMoved) mask |= 2;
+    if (!gs.bkMoved && !gs.brHHMoved) mask |= 4;
+    if (!gs.bkMoved && !gs.brAHMoved) mask |= 8;
+    return mask;
+}
+
+inline int epSquare(const std::optional<std::pair<int, int>>& ep)
+{
+    if (!ep.has_value()) {
+        return -1;
+    }
+    return squareOf(ep->first, ep->second);
+}
+
+inline Bitboard pieceZobrist(const Piece& p, int sq)
+{
+    if (p.type == EMPTY || sq < 0 || sq >= 64) {
+        return 0;
+    }
+    return ZOBRIST.piece[colorIndex(p.white)][pieceIndex(p.type)][sq];
+}
+
+Bitboard computeZobristFromState(const GameState& gs)
+{
+    Bitboard h = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+        const Piece p = decodePiece(gs.pieceOnSquare[sq]);
+        if (p.type != EMPTY) {
+            h ^= pieceZobrist(p, sq);
+        }
+    }
+
+    h ^= ZOBRIST.castling[castlingRightsMask(gs)];
+
+    const int epsq = epSquare(gs.enPassantTarget);
+    if (epsq >= 0) {
+        h ^= ZOBRIST.enPassant[epsq];
+    }
+
+    if (!gs.whiteToMove) {
+        h ^= ZOBRIST.sideToMove;
+    }
+
+    return h;
+}
+
 std::vector<std::string> split(const std::string& s, char delimiter)
 {
     std::vector<std::string> tokens;
@@ -46,6 +129,11 @@ Bitboard popLsb(Bitboard& bb)
 int lsbSquare(Bitboard bb)
 {
     return __builtin_ctzll(bb);
+}
+
+int msbSquare(Bitboard bb)
+{
+    return 63 - __builtin_clzll(bb);
 }
 
 void clearBitboards(GameState& gs)
@@ -137,8 +225,130 @@ std::array<Bitboard, 64> initKingAttacks()
     return attacks;
 }
 
+std::array<std::array<Bitboard, 64>, 2> initPawnAttacks()
+{
+    std::array<std::array<Bitboard, 64>, 2> attacks{};
+
+    for (int sq = 0; sq < 64; ++sq) {
+        const int r = rowOf(sq);
+        const int c = colOf(sq);
+
+        Bitboard whiteAttacks = 0;
+        if (r > 0 && c > 0) {
+            whiteAttacks |= bitAt(squareOf(r - 1, c - 1));
+        }
+        if (r > 0 && c < 7) {
+            whiteAttacks |= bitAt(squareOf(r - 1, c + 1));
+        }
+        attacks[WHITE][sq] = whiteAttacks;
+
+        Bitboard blackAttacks = 0;
+        if (r < 7 && c > 0) {
+            blackAttacks |= bitAt(squareOf(r + 1, c - 1));
+        }
+        if (r < 7 && c < 7) {
+            blackAttacks |= bitAt(squareOf(r + 1, c + 1));
+        }
+        attacks[BLACK][sq] = blackAttacks;
+    }
+
+    return attacks;
+}
+
+std::array<std::array<Bitboard, 64>, 2> initPawnAttackers(const std::array<std::array<Bitboard, 64>, 2>& pawnAttacks)
+{
+    std::array<std::array<Bitboard, 64>, 2> attackers{};
+
+    for (int color = 0; color < 2; ++color) {
+        for (int fromSq = 0; fromSq < 64; ++fromSq) {
+            Bitboard targets = pawnAttacks[color][fromSq];
+            while (targets) {
+                const int toSq = lsbSquare(popLsb(targets));
+                attackers[color][toSq] |= bitAt(fromSq);
+            }
+        }
+    }
+
+    return attackers;
+}
+
+enum Direction : int {
+    NORTH = 0,
+    SOUTH = 1,
+    WEST = 2,
+    EAST = 3,
+    NORTH_WEST = 4,
+    NORTH_EAST = 5,
+    SOUTH_WEST = 6,
+    SOUTH_EAST = 7
+};
+
+std::array<std::array<Bitboard, 64>, 8> initRays()
+{
+    std::array<std::array<Bitboard, 64>, 8> rays{};
+    static constexpr int dr[8] = { -1, 1, 0, 0, -1, -1, 1, 1 };
+    static constexpr int dc[8] = { 0, 0, -1, 1, -1, 1, -1, 1 };
+
+    for (int sq = 0; sq < 64; ++sq) {
+        const int r = rowOf(sq);
+        const int c = colOf(sq);
+        for (int dir = 0; dir < 8; ++dir) {
+            Bitboard ray = 0;
+            int nr = r + dr[dir];
+            int nc = c + dc[dir];
+            while (inBounds(nr, nc)) {
+                ray |= bitAt(squareOf(nr, nc));
+                nr += dr[dir];
+                nc += dc[dir];
+            }
+            rays[dir][sq] = ray;
+        }
+    }
+
+    return rays;
+}
+
+inline bool directionIncreasesSquare(int dir)
+{
+    return dir == SOUTH || dir == EAST || dir == SOUTH_WEST || dir == SOUTH_EAST;
+}
+
+inline Bitboard rayAttacks(int sq, Bitboard occupancy, const int* dirs, int dirCount, const std::array<std::array<Bitboard, 64>, 8>& rays)
+{
+    Bitboard attacks = 0;
+    for (int i = 0; i < dirCount; ++i) {
+        const int dir = dirs[i];
+        const Bitboard ray = rays[dir][sq];
+        attacks |= ray;
+
+        const Bitboard blockers = ray & occupancy;
+        if (!blockers) {
+            continue;
+        }
+
+        const int blockerSq = directionIncreasesSquare(dir) ? lsbSquare(blockers) : msbSquare(blockers);
+        attacks &= ~rays[dir][blockerSq];
+    }
+    return attacks;
+}
+
+inline Bitboard bishopAttacks(int sq, Bitboard occupancy, const std::array<std::array<Bitboard, 64>, 8>& rays)
+{
+    static constexpr int dirs[4] = { NORTH_WEST, NORTH_EAST, SOUTH_WEST, SOUTH_EAST };
+    return rayAttacks(sq, occupancy, dirs, 4, rays);
+}
+
+inline Bitboard rookAttacks(int sq, Bitboard occupancy, const std::array<std::array<Bitboard, 64>, 8>& rays)
+{
+    static constexpr int dirs[4] = { NORTH, SOUTH, WEST, EAST };
+    return rayAttacks(sq, occupancy, dirs, 4, rays);
+}
+
+const std::array<std::array<Bitboard, 64>, 2> PAWN_ATTACKS = initPawnAttacks();
+const std::array<std::array<Bitboard, 64>, 2> PAWN_ATTACKERS = initPawnAttackers(PAWN_ATTACKS);
 const std::array<Bitboard, 64> KNIGHT_ATTACKS = initKnightAttacks();
 const std::array<Bitboard, 64> KING_ATTACKS = initKingAttacks();
+const std::array<std::array<Bitboard, 64>, 8> RAYS = initRays();
 
 void addMove(MoveList& moves, int fromSq, int toSq, int capturedType = EMPTY,
     bool isEnPassant = false, bool isCastle = false, bool promotion = false, int promotionType = Q)
@@ -350,6 +560,8 @@ void GameState::loadFromFen(const std::string& fen)
     halfmoveClock = (parts.size() > 4) ? std::stoi(parts[4]) : 0;
     fullmoveNumber = (parts.size() > 5) ? std::stoi(parts[5]) : 1;
 
+    zobristKey = computeZobristFromState(*this);
+
     positionHashCounts[positionHash(*this)]++;
 }
 
@@ -361,61 +573,26 @@ void GameState::initStandard()
 bool isSquareAttacked(const GameState& gs, int r, int c, bool byWhite)
 {
     const int sq = squareOf(r, c);
+    const int attackerColor = colorIndex(byWhite);
 
-    if (byWhite) {
-        if (r < 7 && c > 0 && (gs.bitboards[WHITE][pieceIndex(P)] & bitAt(squareOf(r + 1, c - 1))))
-            return true;
-        if (r < 7 && c < 7 && (gs.bitboards[WHITE][pieceIndex(P)] & bitAt(squareOf(r + 1, c + 1))))
-            return true;
-    } else {
-        if (r > 0 && c > 0 && (gs.bitboards[BLACK][pieceIndex(P)] & bitAt(squareOf(r - 1, c - 1))))
-            return true;
-        if (r > 0 && c < 7 && (gs.bitboards[BLACK][pieceIndex(P)] & bitAt(squareOf(r - 1, c + 1))))
-            return true;
+    if (PAWN_ATTACKERS[attackerColor][sq] & gs.bitboards[attackerColor][pieceIndex(P)]) {
+        return true;
     }
 
-    if (KNIGHT_ATTACKS[sq] & gs.bitboards[colorIndex(byWhite)][pieceIndex(N)])
+    if (KNIGHT_ATTACKS[sq] & gs.bitboards[attackerColor][pieceIndex(N)])
         return true;
 
-    if (KING_ATTACKS[sq] & gs.bitboards[colorIndex(byWhite)][pieceIndex(K)])
+    if (KING_ATTACKS[sq] & gs.bitboards[attackerColor][pieceIndex(K)])
         return true;
 
-    static constexpr int diag[4][2] = { { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 } };
-    for (const auto& d : diag) {
-        int nr = r + d[0];
-        int nc = c + d[1];
-        while (inBounds(nr, nc)) {
-            const int s = squareOf(nr, nc);
-            const Bitboard m = bitAt(s);
-            if (gs.occupancyBoth & m) {
-                if ((gs.bitboards[colorIndex(byWhite)][pieceIndex(B)] & m) ||
-                    (gs.bitboards[colorIndex(byWhite)][pieceIndex(Q)] & m)) {
-                    return true;
-                }
-                break;
-            }
-            nr += d[0];
-            nc += d[1];
-        }
+    const Bitboard bishopLike = bishopAttacks(sq, gs.occupancyBoth, RAYS);
+    if (bishopLike & (gs.bitboards[attackerColor][pieceIndex(B)] | gs.bitboards[attackerColor][pieceIndex(Q)])) {
+        return true;
     }
 
-    static constexpr int ortho[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
-    for (const auto& d : ortho) {
-        int nr = r + d[0];
-        int nc = c + d[1];
-        while (inBounds(nr, nc)) {
-            const int s = squareOf(nr, nc);
-            const Bitboard m = bitAt(s);
-            if (gs.occupancyBoth & m) {
-                if ((gs.bitboards[colorIndex(byWhite)][pieceIndex(R)] & m) ||
-                    (gs.bitboards[colorIndex(byWhite)][pieceIndex(Q)] & m)) {
-                    return true;
-                }
-                break;
-            }
-            nr += d[0];
-            nc += d[1];
-        }
+    const Bitboard rookLike = rookAttacks(sq, gs.occupancyBoth, RAYS);
+    if (rookLike & (gs.bitboards[attackerColor][pieceIndex(R)] | gs.bitboards[attackerColor][pieceIndex(Q)])) {
+        return true;
     }
 
     return false;
@@ -467,25 +644,18 @@ void generatePseudoLegalMoves(const GameState& gs, MoveList& moves)
             }
         }
 
-        for (int dc : { -1, 1 }) {
-            const int nc = c + dc;
-            if (nc < 0 || nc > 7)
-                continue;
-            const int toSq = wtm ? sq - 8 + dc : sq + 8 + dc;
-            if (toSq < 0 || toSq >= 64)
-                continue;
-
-            if (enemyOcc & bitAt(toSq)) {
-                const int capturedType = pieceAtSqImpl(gs, toSq).type;
-                const int toR = rowOf(toSq);
-                const bool isPromotion = (wtm && toR == 0) || (!wtm && toR == 7);
-                if (isPromotion) {
-                    for (int pt : { Q, R, B, N }) {
-                        addMove(moves, sq, toSq, capturedType, false, false, true, pt);
-                    }
-                } else {
-                    addMove(moves, sq, toSq, capturedType);
+        Bitboard captures = PAWN_ATTACKS[us][sq] & enemyOcc;
+        while (captures) {
+            const int toSq = lsbSquare(popLsb(captures));
+            const int capturedType = pieceAtSqImpl(gs, toSq).type;
+            const int toR = rowOf(toSq);
+            const bool isPromotion = (wtm && toR == 0) || (!wtm && toR == 7);
+            if (isPromotion) {
+                for (int pt : { Q, R, B, N }) {
+                    addMove(moves, sq, toSq, capturedType, false, false, true, pt);
                 }
+            } else {
+                addMove(moves, sq, toSq, capturedType);
             }
         }
 
@@ -512,36 +682,44 @@ void generatePseudoLegalMoves(const GameState& gs, MoveList& moves)
         }
     }
 
-    auto genSliding = [&](int type, const std::vector<std::pair<int, int>>& dirs) {
-        Bitboard bb = gs.bitboards[us][pieceIndex(type)];
-        while (bb) {
-            const int sq = lsbSquare(popLsb(bb));
-            const int r = rowOf(sq);
-            const int c = colOf(sq);
-            for (const auto& [dr, dc] : dirs) {
-                int nr = r + dr;
-                int nc = c + dc;
-                while (inBounds(nr, nc)) {
-                    const int toSq = squareOf(nr, nc);
-                    const Bitboard mask = bitAt(toSq);
-                    if (!(gs.occupancyBoth & mask)) {
-                        addMove(moves, sq, toSq);
-                    } else {
-                        if (enemyOcc & mask) {
-                            addMove(moves, sq, toSq, pieceAtSqImpl(gs, toSq).type);
-                        }
-                        break;
-                    }
-                    nr += dr;
-                    nc += dc;
-                }
-            }
+    Bitboard bishops = gs.bitboards[us][pieceIndex(B)];
+    while (bishops) {
+        const int sq = lsbSquare(popLsb(bishops));
+        Bitboard attacks = bishopAttacks(sq, gs.occupancyBoth, RAYS) & ~ownOcc;
+        while (attacks) {
+            const int toSq = lsbSquare(popLsb(attacks));
+            const int capturedType = (enemyOcc & bitAt(toSq))
+                ? static_cast<int>(pieceAtSqImpl(gs, toSq).type)
+                : static_cast<int>(EMPTY);
+            addMove(moves, sq, toSq, capturedType);
         }
-    };
+    }
 
-    genSliding(B, { { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 } });
-    genSliding(R, { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } });
-    genSliding(Q, { { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 }, { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } });
+    Bitboard rooks = gs.bitboards[us][pieceIndex(R)];
+    while (rooks) {
+        const int sq = lsbSquare(popLsb(rooks));
+        Bitboard attacks = rookAttacks(sq, gs.occupancyBoth, RAYS) & ~ownOcc;
+        while (attacks) {
+            const int toSq = lsbSquare(popLsb(attacks));
+            const int capturedType = (enemyOcc & bitAt(toSq))
+                ? static_cast<int>(pieceAtSqImpl(gs, toSq).type)
+                : static_cast<int>(EMPTY);
+            addMove(moves, sq, toSq, capturedType);
+        }
+    }
+
+    Bitboard queens = gs.bitboards[us][pieceIndex(Q)];
+    while (queens) {
+        const int sq = lsbSquare(popLsb(queens));
+        Bitboard attacks = (bishopAttacks(sq, gs.occupancyBoth, RAYS) | rookAttacks(sq, gs.occupancyBoth, RAYS)) & ~ownOcc;
+        while (attacks) {
+            const int toSq = lsbSquare(popLsb(attacks));
+            const int capturedType = (enemyOcc & bitAt(toSq))
+                ? static_cast<int>(pieceAtSqImpl(gs, toSq).type)
+                : static_cast<int>(EMPTY);
+            addMove(moves, sq, toSq, capturedType);
+        }
+    }
 
     Bitboard king = gs.bitboards[us][pieceIndex(K)];
     if (king) {
@@ -611,10 +789,12 @@ void makeMove(GameState& gs, const Move& m, bool trackHistory)
     undo.enPassantTarget = gs.enPassantTarget;
     undo.halfmoveClock = gs.halfmoveClock;
     undo.fullmoveNumber = gs.fullmoveNumber;
+    undo.zobristKey = gs.zobristKey;
 
     const int fromSq = m.from();
     const int toSq = m.to();
     const int fromR = rowOf(fromSq);
+    const int toR = rowOf(toSq);
     const int toC = colOf(toSq);
 
     undo.movedPiece = pieceAtSqImpl(gs, fromSq);
@@ -622,7 +802,48 @@ void makeMove(GameState& gs, const Move& m, bool trackHistory)
     undo.capturedPiece = captured;
     undo.hadCapture = (captured.type != EMPTY);
 
+    Bitboard key = gs.zobristKey;
+    const int oldCastleMask = castlingRightsMask(gs);
+    const int oldEpSq = epSquare(gs.enPassantTarget);
+
+    key ^= ZOBRIST.sideToMove;
+    key ^= ZOBRIST.castling[oldCastleMask];
+    if (oldEpSq >= 0) {
+        key ^= ZOBRIST.enPassant[oldEpSq];
+    }
+
+    key ^= pieceZobrist(undo.movedPiece, fromSq);
+
+    if (m.isEnPassant()) {
+        const int capSq = squareOf(fromR, toC);
+        key ^= pieceZobrist(captured, capSq);
+    } else if (captured.type != EMPTY) {
+        key ^= pieceZobrist(captured, toSq);
+    }
+
+    Piece placedPiece = undo.movedPiece;
+    if (m.isPromotion()) {
+        placedPiece.type = m.promotionType();
+    }
+    key ^= pieceZobrist(placedPiece, toSq);
+
+    if (m.isCastle()) {
+        const int rookFrom = (toC == 6) ? squareOf(toR, 7) : squareOf(toR, 0);
+        const int rookTo = (toC == 6) ? squareOf(toR, 5) : squareOf(toR, 3);
+        const Piece rook { R, undo.movedPiece.white };
+        key ^= pieceZobrist(rook, rookFrom);
+        key ^= pieceZobrist(rook, rookTo);
+    }
+
     applyMoveNoHistory(gs, m);
+
+    const int newCastleMask = castlingRightsMask(gs);
+    key ^= ZOBRIST.castling[newCastleMask];
+    const int newEpSq = epSquare(gs.enPassantTarget);
+    if (newEpSq >= 0) {
+        key ^= ZOBRIST.enPassant[newEpSq];
+    }
+    gs.zobristKey = key;
 
     if (gs.undoTop < static_cast<int>(gs.undoStack.size())) {
         gs.undoStack[gs.undoTop++] = undo;
@@ -667,6 +888,7 @@ void undoMove(GameState& gs, bool trackHistory)
     gs.enPassantTarget = undo.enPassantTarget;
     gs.halfmoveClock = undo.halfmoveClock;
     gs.fullmoveNumber = undo.fullmoveNumber;
+    gs.zobristKey = undo.zobristKey;
 
     const Piece movedNow = pieceAtSqImpl(gs, toSq);
     removePiece(gs, toSq, movedNow);
@@ -815,32 +1037,12 @@ std::string boardToString(const GameState& gs)
 
 std::uint64_t positionHash(const GameState& gs)
 {
-    // FNV-1a over piece placement plus repetition-relevant state.
-    std::uint64_t h = 1469598103934665603ULL;
-    for (int sq = 0; sq < 64; ++sq) {
-        h ^= static_cast<std::uint64_t>(gs.pieceOnSquare[sq]);
-        h *= 1099511628211ULL;
-    }
+    return gs.zobristKey;
+}
 
-    h ^= static_cast<std::uint64_t>(gs.whiteToMove ? 1u : 2u);
-    h *= 1099511628211ULL;
-
-    std::uint64_t castlingBits = 0;
-    castlingBits |= (!gs.wkMoved && !gs.wrHHMoved) ? 1ULL : 0ULL;
-    castlingBits |= (!gs.wkMoved && !gs.wrAHMoved) ? 2ULL : 0ULL;
-    castlingBits |= (!gs.bkMoved && !gs.brHHMoved) ? 4ULL : 0ULL;
-    castlingBits |= (!gs.bkMoved && !gs.brAHMoved) ? 8ULL : 0ULL;
-    h ^= castlingBits;
-    h *= 1099511628211ULL;
-
-    if (gs.enPassantTarget.has_value()) {
-        h ^= static_cast<std::uint64_t>(16 + gs.enPassantTarget->first * 8 + gs.enPassantTarget->second);
-    } else {
-        h ^= 0xFFULL;
-    }
-    h *= 1099511628211ULL;
-
-    return h;
+std::uint64_t recomputePositionHash(const GameState& gs)
+{
+    return computeZobristFromState(gs);
 }
 
 std::optional<std::string> checkGameOver(GameState& gs)
